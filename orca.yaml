@@ -1,0 +1,5 @@
+scripts:
+  setup: |
+    echo 'hi'
+  archive: |
+    echo 'done'
