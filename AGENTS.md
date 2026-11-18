@@ -32,7 +32,6 @@ React·TypeScript로 만든 GitHub Pages 개인 사이트다. 목적과 사용�
 
 ## 함정
 
-- 배포 주소는 `https://myungjinki.github.io/`인데 `package.json`의 `homepage`와 `src/routes/Home.tsx`의 링크는 옛 계정 주소 `myungjinki91.github.io`를 쓴다(`TASKS.md` PMGI-3).
 - `docs/`는 React 빌드 결과가 아니라 옛 정적 HTML 사이트다. Pages는 `gh-pages` 브랜치를 배포하므로 `docs/`를 고쳐도 사이트는 바뀌지 않는다.
 - `build/`는 `.gitignore`에 있어 커밋하지 않는다. `npm run deploy`가 만들어 `gh-pages` 브랜치에 올린다.
 

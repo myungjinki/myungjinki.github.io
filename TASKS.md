@@ -16,7 +16,6 @@
 |---|---|---|---|
 | PMGI-1 | 정리 | 옛 정적 사이트 `docs/`를 지울지 남길지 정하고, 정한 대로 `docs/`와 README '구성'의 설명을 맞추면 끝 | 사용자: `docs/` 삭제 여부 결정 |
 | PMGI-2 | 문서 | 사이트의 목표·범위·완료 기준을 정해 `docs/plan.md`에 적고 README '문서'에서 가리키면 끝 | 사용자: 목표·범위 결정 (`docs/` 위치는 PMGI-1 뒤) |
-| PMGI-3 | 수정 | `package.json` `homepage`와 `src/routes/Home.tsx` 링크를 `myungjinki.github.io` 주소로 바꾸고 `npm run build`가 통과하면 끝 | AI |
 
 ## 주기적
 
