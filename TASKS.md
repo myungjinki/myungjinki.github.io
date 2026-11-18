@@ -14,6 +14,7 @@
 
 | 번호 | 구분 | 할 일 | 차례 |
 |---|---|---|---|
+| PMGI-5 | 번호 | 할 일 번호를 `T-n`에서 `PMGI-n`으로 바꾼다. `TASKS.md` 머리말에 티커 `PMGI`를 적고 번호 규칙을 `PMGI-번호`로 고친다(양식은 `gg-template` 기본 `TASKS.md`). `TASKS`·`LANDED`·`STATE`·README·AGENTS·`docs/`의 이 저장소 `T-n`은 `PMGI-n`으로, 다른 저장소의 번호는 역할 표에서 저장소 목록을 맡은 곳의 `docs/repo-list.md`의 티커로 바꾼다. AGENTS 커밋 규칙의 `(T-n)`은 티커 없이 끝낸 할 일의 번호를 붙인다고 쓴다. 커밋 메시지와 `docs/reports/`는 그대로 둔다. `grep`으로 `T-[0-9]`가 당시 결정을 적은 기록 말고는 남지 않고 커밋하면 끝난다 | AI |
 | T-1 | 정리 | 옛 정적 사이트 `docs/`를 지울지 남길지 정하고, 정한 대로 `docs/`와 README '구성'의 설명을 맞추면 끝 | 사용자: `docs/` 삭제 여부 결정 |
 | T-2 | 문서 | 사이트의 목표·범위·완료 기준을 정해 `docs/plan.md`에 적고 README '문서'에서 가리키면 끝 | 사용자: 목표·범위 결정 (`docs/` 위치는 T-1 뒤) |
 | T-3 | 수정 | `package.json` `homepage`와 `src/routes/Home.tsx` 링크를 `myungjinki.github.io` 주소로 바꾸고 `npm run build`가 통과하면 끝 | AI |
