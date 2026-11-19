@@ -17,6 +17,7 @@ React·TypeScript로 만든 GitHub Pages 개인 사이트다. 목적과 사용�
 ## 할 일
 
 - 작업을 시작하기 전에 `TASKS.md`와 `STATE.md`를 읽는다.
+- 일을 잡을 때 항목의 `등급`과 지금 세션 모델의 등급을 비교해 [AI 사용 전략](https://github.com/myungjinki/role-ai-engineer/blob/main/docs/ai-strategy.md#맡기는-법)의 '맡기는 법'을 따른다.
 - 세션을 끝내기 전에 `STATE.md` '진행 중'을 지금과 맞춘다.
 - 번호·차례·잡은 일·끝내거나 취소한 일의 기록은 `TASKS.md`, `STATE.md`, `LANDED.md`의 머리말을 따른다.
 

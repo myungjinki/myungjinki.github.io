@@ -4,6 +4,7 @@
 
 | 번호 | 날짜 | 바뀐 것 | 모델 |
 |---|---|---|---|
+| PMGI-7 | 2026-11-19 | `AGENTS.md` '할 일'에 `등급`과 세션 모델 등급을 비교해 '맡기는 법'을 따르는 줄을 합쳤다 | Sonnet 5.5 |
 | PMGI-6 | 2026-11-19 | `TASKS.md`에 `등급` 열과 머리말 줄을, `LANDED.md`에 `모델` 열과 머리말 설명을 더했다 | Sonnet 5.5 |
 | PMGI-3 | 2026-11-19 | `package.json` `homepage`와 `src/routes/Home.tsx`의 주소를 옛 계정 `myungjinki91.github.io`에서 `myungjinki.github.io`로 바꿨다 | - |
 | PMGI-5 | 2026-11-19 | 할 일 번호를 `T-n`에서 티커를 붙인 `PMGI-n`으로 바꿨다 | - |
