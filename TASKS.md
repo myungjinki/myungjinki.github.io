@@ -16,6 +16,7 @@
 
 | 번호 | 구분 | 할 일 | 등급 | 차례 |
 |---|---|---|---|---|
+| PMGI-7 | 지침 | 공통 양식(`gg-template` 0.38.1 이상) `AGENTS.md` '할 일'의 줄 "일을 잡을 때 항목의 `등급`과 지금 세션 모델의 등급을 비교해 [AI 사용 전략](https://github.com/myungjinki/role-ai-engineer/blob/main/docs/ai-strategy.md#맡기는-법)의 '맡기는 법'을 따른다."를 이 저장소 `AGENTS.md`의 할 일 규칙 자리에 합친다. 모델 이름은 적지 않는다. 합쳐 커밋하면 끝난다 | 중 | AI |
 | PMGI-1 | 정리 | 옛 정적 사이트 `docs/`를 지울지 남길지 정하고, 정한 대로 `docs/`와 README '구성'의 설명을 맞추면 끝 | - | 사용자: `docs/` 삭제 여부 결정 |
 | PMGI-2 | 문서 | 사이트의 목표·범위·완료 기준을 정해 `docs/plan.md`에 적고 README '문서'에서 가리키면 끝 | - | 사용자: 목표·범위 결정 (`docs/` 위치는 PMGI-1 뒤) |
 
