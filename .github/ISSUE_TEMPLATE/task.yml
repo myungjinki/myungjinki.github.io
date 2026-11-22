@@ -1,0 +1,54 @@
+name: 할 일
+description: 일회성 할 일 하나를 올린다. 번호는 주 폴더의 `scripts/tasks.py sync`가 붙인다.
+labels: ["차례:사용자"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        제목에는 짧은 제목만 적는다. 다음 `sync`가 제목 앞에 번호를 붙이고, 아래 칸을 본문 `순서:`·`대기:` 줄과 `구분:`·`등급:`·`차례:` 라벨로 바꾼다. 그 전까지는 `차례:사용자` 라벨이라 AI가 잡지 않는다.
+  - type: textarea
+    id: text
+    attributes:
+      label: 할 일
+      description: 무엇이 되면 끝인지까지 적는다.
+    validations:
+      required: true
+  - type: input
+    id: kind
+    attributes:
+      label: 구분
+      description: "TASKS.md '일회성' 표의 구분 값(예: 문서, 스크립트)"
+    validations:
+      required: true
+  - type: dropdown
+    id: grade
+    attributes:
+      label: 등급
+      description: 맡길 모델 등급. 모르면 비워 둔다.
+      options:
+        - 최상
+        - 상
+        - 중
+        - 하
+  - type: dropdown
+    id: turn
+    attributes:
+      label: 차례
+      description: AI가 바로 할 일이면 AI, 사용자 결정을 기다리면 사용자, 조건을 기다리면 대기
+      options:
+        - AI
+        - 사용자
+        - 대기
+      default: 0
+    validations:
+      required: true
+  - type: input
+    id: wait
+    attributes:
+      label: 대기 조건
+      description: "차례가 대기일 때만 적는다(예: 2026-12-01, 다른 일 끝남)."
+  - type: input
+    id: order
+    attributes:
+      label: 순서
+      description: 작을수록 먼저. 비우면 순서 없이 표 끝에 놓인다.

@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 scripts/tasks.py hook",
+            "statusMessage": "할 일 읽는 중",
+            "timeout": 20
+          }
+        ]
+      }
+    ]
+  }
+}

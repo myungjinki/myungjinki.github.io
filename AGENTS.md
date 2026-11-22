@@ -16,10 +16,12 @@
 
 ## 할 일
 
-- 작업을 시작하기 전에 `TASKS.md`와 `STATE.md`를 읽는다.
+- 일회성 할 일의 원본은 이 저장소의 GitHub Issues이고, `TASKS.md` '일회성' 표·`STATE.md` '진행 중' 표·`LANDED.md`는 주 폴더의 `python3 scripts/tasks.py sync`만 쓰는 사본이다. 흐름은 [할 일 기록 흐름](https://github.com/myungjinki/role-ai-engineer/blob/main/docs/task-issues.md), 명령은 `TASKS.md` '일회성' 머리말을 따른다.
+- 세션 시작 훅(`.claude/settings.json`)이 `python3 scripts/tasks.py hook` 출력(열린 이슈의 번호·제목·구분·등급·차례 요약표, 진행 중, 막지 않은 실패, 밀린 주기적 항목, 날짜가 지난 대기 항목)을 보여 준다. 할 일 본문과 끝 조건은 출력에 없으니 일을 잡기 전에 `tasks.py show PMGI-n`으로 읽는다. 훅이 없으면 그 명령을 직접 실행한다. 시작 전에 `STATE.md`도 읽는다. 출력이 '사본을 보인다'고 하거나 막지 않은 실패·밀린 항목이 있으면 첫 응답에서 알린다.
+- 세션을 끝내기 전에 잡은 일의 '멈춘 곳'과 '다음 걸음'을 `tasks.py note`로 남기고, 주 폴더에서 `tasks.py sync`로 사본을 맞춰 바뀐 사본을 커밋한다. 주 폴더가 기본 브랜치가 아니거나 `origin`보다 뒤처졌으면 sync가 멈추므로, 기본 브랜치로 돌아가 `git pull --ff-only`(또는 `sync --pull`) 뒤 다시 한다.
+- worktree에서는 `TASKS.md`·`STATE.md`·`LANDED.md`를 고치지 않는다.
+- 명령이 틀렸거나 도구가 예상과 다르게 동작해 다시 해야 했으면 `tasks.py fail`로 그 이슈에 남기고, 막으면 `tasks.py fixed`로 막은 방법을 남긴다.
 - 일을 잡을 때 항목의 `등급`과 지금 세션 모델의 등급을 비교해 [AI 사용 전략](https://github.com/myungjinki/role-ai-engineer/blob/main/docs/ai-strategy.md#맡기는-법)의 '맡기는 법'을 따른다.
-- 세션을 끝내기 전에 `STATE.md` '진행 중'을 지금과 맞춘다.
-- 번호·차례·잡은 일·끝내거나 취소한 일의 기록은 `TASKS.md`, `STATE.md`, `LANDED.md`의 머리말을 따른다.
 
 ## 문서
 
@@ -41,7 +43,8 @@
 - 일 하나를 끝낼 때마다 커밋한다. 검증을 통과한 뒤 관련 파일만 명시해서 스테이징한다.
 - 기존 사용자 변경을 덮어쓰거나 되돌리지 않는다.
 - 되돌리기 어려운 결정은 이유와 함께 이 구역에 적는다.
-- 푸시·PR·머지는 ship이나 ship-all로 한다.
+- 일을 끝내 커밋했거나 푸시·PR·머지를 요청받으면 ship이나 ship-all로 묻지 않고 한다.
+- ship은 `scripts/check-task-files.py`가 있으면 그 검사를 자동으로 하므로 검사 명령에 따로 넣지 않는다. ship은 worktree에서 할 일 파일을 고쳤거나 아직 푸시하지 않은 브랜치가 최신 `origin/main` 위에 있지 않으면 멈춘다. 뒤의 경우 커밋한 뒤 `git rebase origin/main`으로 올리고 다시 ship한다. 이슈의 할 일을 끝낼 때는 ship에 `--task PMGI-n --model "<모델>" --summary "<완료 내용>"`을 준다. ship이 PR 본문에 닫을 이슈를 넣고 머지 뒤 완료 댓글을 남긴다. 주 폴더의 기본 브랜치가 깨끗하면 사본을 동기화하고 바뀐 사본을 직접 푸시한다.
 - 커밋 메시지는 영어, 동사 원형으로 시작하고 첫 글자는 대문자, 마침표 없이 50자 안팎. 필요하면 한 줄 띄우고 본문. 할 일을 끝낸 커밋은 메시지 끝에 끝낸 할 일의 번호를 괄호로 붙인다.
 
 ## 프로젝트 작업 기준
