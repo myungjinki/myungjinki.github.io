@@ -1,0 +1,28 @@
+# 할 일 사본(TASKS.md·STATE.md·LANDED.md)은 주 폴더에서 `scripts/tasks.py sync`로만 고치고,
+# ship은 사본만 바뀐 커밋을 기본 브랜치에 바로 푸시한다. 그래서 PR이 이 파일을 고치면 막는다.
+name: task-files
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: PR이 할 일 사본을 고치지 않았는지 확인
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          changed=$(git diff --name-only "$BASE...$HEAD" -- TASKS.md STATE.md LANDED.md)
+          if [ -n "$changed" ]; then
+            echo "::error::PR이 할 일 사본을 고쳤다: $changed"
+            echo "되돌리고 할 일은 scripts/tasks.py로 이슈에 남긴다. 사본은 주 폴더의 sync가 쓴다."
+            exit 1
+          fi

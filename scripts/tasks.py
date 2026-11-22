@@ -1,0 +1,1266 @@
+#!/usr/bin/env python3
+"""일회성 할 일을 GitHub Issues에 두고, 파일에는 사본만 둔다.
+
+쓰기(이슈에만 쓴다): add, edit, claim, note, turn, release, close, cancel, reopen, fail, fixed
+읽기: show(이슈를 표로 보인다. 번호를 주면 할 일 전체), hook(세션 시작 출력: 제목·메타 요약표와 알릴 것만)
+사본: sync(주 폴더에서 TASKS.md '일회성' 표, STATE.md '진행 중' 표, LANDED.md를 이슈에 맞춘다)
+
+끝내는 순서: PR 본문의 `Closes #n`이 머지할 때 이슈를 먼저 닫고, 그 뒤 `close`가 닫힌 이슈에 `끝:` 댓글을 단다.
+그 사이에 sync가 돌면 LANDED.md에 `(요약 없음, 이슈 #n)` 행이 들어가지만, 다음 sync가 댓글을 읽어 그 행을
+고치고 `--now`를 다시 보인다. sync는 주 폴더가 기본 브랜치에 있고 origin보다 뒤처지지 않았을 때만 쓴다.
+
+설정은 대상 저장소의 scripts/tasks.json({"ticker": "RAE", "offset": n})에 둔다. 새 번호는 이슈 번호 + offset이다.
+이슈 본문은 할 일 설명 뒤에 `순서: n`·`대기: 조건` 줄을 둔다. 라벨은 `구분:`·`등급:`·`차례:`, `진행중`, `막을 것`이다.
+댓글의 첫 줄로 상태를 남긴다: `잡음: 이름`, `놓음: 이름`, `메모: 이름`, `끝: 모델`, `취소: 이름`, `다시 엶: 이름`,
+`실패: 이름`, `막음: 이름`. `claim`은 댓글에 브랜치·워크트리·시각을 남기고 워크트리별 `.git/tasks-session.json`에
+세션 이름과 잡은 일을 저장해 같은 워크트리에서 무인자 `note`·`release`가 동작하게 한다. 24시간 이상 갱신 없는
+선점은 `hook`·`show`·`sync`와 `claim` 충돌 안내에서 경고한다.
+
+할 일 이슈는 제목이 `<티커>-n`으로 시작하거나 `구분:`·`등급:`·`차례:` 라벨이 하나라도 있는 이슈다. 그 밖의 이슈(버그 신고 등)는
+표·LANDED에 넣지 않고 제목도 바꾸지 않는다. 할 일로 삼으려면 `turn #이슈번호 AI`로 차례 라벨을 단다.
+
+GitHub 웹·휴대폰에서 `.github/ISSUE_TEMPLATE/task.yml` 양식으로 만든 이슈는 `### 할 일` 같은 칸 제목으로 본문이 온다.
+`show`·`hook`은 그 칸을 읽어 보이고, `sync`는 본문을 `순서:`·`대기:` 줄 형식으로, 고른 칸을 `구분:`·`등급:`·`차례:` 라벨로 바꾼다.
+"""
+from __future__ import annotations
+
+import argparse
+from concurrent.futures import ThreadPoolExecutor
+import importlib.util
+import json
+import re
+import secrets
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+
+SCRIPTS = Path(__file__).resolve().parent
+# Increase when a changed tasks.py should replace older repository copies.
+TASKS_SCRIPT_VERSION = 1
+KST = timezone(timedelta(hours=9))
+ACTIVE = "진행중"
+FAILED = "막을 것"
+TURNS = ("AI", "사용자", "대기")
+GRADES = ("최상", "상", "중", "하", "-")
+FIELDS = "number,title,body,labels,comments,state,closedAt,url"
+BRIEF = "number,title,labels,state,closedAt"
+TASK_LABELS = ("구분", "등급", "차례")
+REOPENED = "다시 엶"
+META = re.compile(r"^(순서|대기):\s*(.*)$")
+NOTICE = "이 표는 GitHub Issues의 사본이다. 고치지 말고 scripts/tasks.py를 쓴다."
+# 이슈 양식(.github/ISSUE_TEMPLATE/task.yml)의 칸 제목 → 본문 메타나 라벨 이름
+FORM_FIELDS = {"할 일": "text", "구분": "구분", "등급": "등급", "차례": "차례", "순서": "순서", "대기 조건": "대기"}
+NO_RESPONSE = "_No response_"
+LABEL_COLORS = {"차례": "1d76db", "등급": "5319e7", "구분": "0e8a16", ACTIVE: "d93f0b", FAILED: "b60205"}
+STALE_HOURS = 24
+CACHE_TTL_SECONDS = 180
+ISSUE_FIELDS = """
+    number title body state closedAt url
+    labels(first:100) { nodes { name } pageInfo { hasNextPage } }
+    comments(last:100) { nodes { body createdAt url } pageInfo { hasPreviousPage } }
+"""
+OPEN_AND_FAILED = """
+query($owner:String!, $name:String!) {
+    repository(owner:$owner, name:$name) {
+        opened:issues(states:OPEN, first:100) { nodes { ...TaskIssue } pageInfo { hasNextPage } }
+        failed:issues(filterBy:{labels:["막을 것"]}, first:100) { nodes { ...TaskIssue } pageInfo { hasNextPage } }
+    }
+}
+fragment TaskIssue on Issue { %s }
+""" % ISSUE_FIELDS
+
+
+class GhError(Exception):
+    pass
+
+
+# ---------- 순수 함수: 테스트 대상 ----------
+
+def load_config(path):
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    return data["ticker"], int(data["offset"])
+
+
+def ticker_of(title, ticker):
+    """Split an issue title into (ticker id or None, rest)."""
+    match = re.match(rf"^({re.escape(ticker)}-\d+)\b\s*(.*)$", (title or "").strip())
+    return (match.group(1), match.group(2).strip()) if match else (None, (title or "").strip())
+
+
+def parse_body(body):
+    """Split an issue body into (text, meta) where meta holds the trailing 순서·대기 lines."""
+    lines = (body or "").replace("\r\n", "\n").rstrip().split("\n")
+    meta = {}
+    while lines and (not lines[-1].strip() or META.match(lines[-1].strip())):
+        line = lines.pop().strip()
+        if line:
+            key, value = META.match(line).groups()
+            meta.setdefault(key, value.strip())
+    return "\n".join(lines).strip(), meta
+
+
+def make_body(text, meta):
+    tail = [f"{key}: {meta[key]}" for key in ("순서", "대기") if meta.get(key) not in (None, "")]
+    return text.strip() + ("\n\n" + "\n".join(tail) if tail else "") + "\n"
+
+
+def parse_form(body):
+    """Read the fields of an issue made from the task form, or None for any other body."""
+    parts = re.split(r"(?m)^### (.+?)[ \t]*$", (body or "").replace("\r\n", "\n"))
+    if len(parts) < 3 or parts[0].strip() or parts[1] != "할 일":
+        return None
+    fields = {}
+    for name, value in zip(parts[1::2], parts[2::2]):
+        value = value.strip()
+        if name in FORM_FIELDS and value and value != NO_RESPONSE:
+            fields[FORM_FIELDS[name]] = value
+    return fields
+
+
+def form_fix(issue):
+    """Return (body, add, drop) that turn a task-form issue into the usual body and labels, or None."""
+    form = parse_form(issue.get("body"))
+    if form is None:
+        return None
+    valid = {"구분": lambda v: True, "등급": lambda v: v in GRADES[:4], "차례": lambda v: v in TURNS}
+    add = [f"{key}:{form[key]}" for key in TASK_LABELS if key in form and valid[key](form[key])]
+    prefixes = {name.split(":", 1)[0] for name in add}
+    drop = [n for n in label_names(issue) if n.split(":", 1)[0] in prefixes and n not in add]
+    body = make_body(form.get("text", ""), {key: form.get(key) for key in ("순서", "대기")})
+    return body, add, drop
+
+
+def label_names(issue):
+    return [label["name"] if isinstance(label, dict) else label for label in issue.get("labels") or []]
+
+
+def is_task(issue, ticker):
+    """True for issues tasks.py manages: a ticker title or any 구분·등급·차례 label."""
+    if ticker_of(issue.get("title"), ticker)[0]:
+        return True
+    return any(name.split(":", 1)[0] in TASK_LABELS for name in label_names(issue) if ":" in name)
+
+
+def label_value(names, prefix):
+    for name in names:
+        if name.startswith(prefix + ":"):
+            return name.split(":", 1)[1]
+    return None
+
+
+def comment_key(comment):
+    match = re.search(r"(\d+)$", comment.get("url") or "")
+    return comment.get("createdAt") or "", int(match.group(1)) if match else 0
+
+
+def head_of(comment):
+    """Return (keyword, value) from a comment's first line, e.g. ('잡음', 'name')."""
+    first = (comment.get("body") or "").strip().replace("\r\n", "\n").split("\n", 1)[0].strip()
+    if ":" not in first:
+        return first, ""
+    keyword, value = first.split(":", 1)
+    return keyword.strip(), value.strip()
+
+
+def fields_of(comment):
+    """Read `key: value` lines after the first line of a comment."""
+    found = {}
+    for line in (comment.get("body") or "").replace("\r\n", "\n").split("\n")[1:]:
+        if ":" in line:
+            key, value = line.split(":", 1)
+            found.setdefault(key.strip(), value.strip())
+    return found
+
+
+def parse_time(stamp):
+    """Parse an ISO timestamp string to an aware datetime, or None."""
+    if not stamp:
+        return None
+    try:
+        dt = datetime.fromisoformat(stamp.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=KST)
+
+
+def claim_info(comments):
+    """Return current claim details: holder, branch, worktree, claimed_at, activity_at, note.
+
+    The holder is the earliest 잡음 since the last 놓음·끝·취소, so when two sessions
+    claim at once every reader picks the same winner. Notes reset with the holder.
+    """
+    holder, meta, claimed_at, activity_at, note = None, {}, "", "", {}
+    for comment in sorted(comments or [], key=comment_key):
+        keyword, value = head_of(comment)
+        if keyword in ("놓음", "끝", "취소"):
+            holder, meta, claimed_at, activity_at, note = None, {}, "", "", {}
+        elif keyword == "잡음" and holder is None:
+            holder = value
+            meta = fields_of(comment)
+            claimed_at = meta.get("시각") or comment.get("createdAt") or ""
+            activity_at = claimed_at
+        elif keyword == "메모":
+            note = fields_of(comment)
+            if holder is not None and comment.get("createdAt"):
+                activity_at = comment["createdAt"]
+    return {
+        "holder": holder,
+        "branch": meta.get("브랜치", ""),
+        "worktree": meta.get("워크트리", ""),
+        "claimed_at": claimed_at,
+        "activity_at": activity_at,
+        "note": note,
+    }
+
+
+def claim_state(comments):
+    """Return (holder, note fields) from comments."""
+    info = claim_info(comments)
+    return info["holder"], info["note"]
+
+
+def claim_age_hours(info, now=None):
+    """Hours elapsed since the last activity on an active claim, or None."""
+    if not info or not info.get("holder"):
+        return None
+    when = parse_time(info.get("activity_at") or info.get("claimed_at"))
+    if when is None:
+        return None
+    current = now or datetime.now(KST)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=KST)
+    return (current - when).total_seconds() / 3600
+
+
+def stale_claim_lines(items, now=None, hours=STALE_HOURS):
+    """Warning lines for active claims older than `hours` without recent activity."""
+    lines = []
+    for item in sort_items(items):
+        age = claim_age_hours(item, now=now)
+        if age is None or age < hours:
+            continue
+        where = f", 브랜치 {item['branch']}" if item.get("branch") else ""
+        lines.append(
+            f"- {item['id']} ({item['holder']}, {int(age)}시간 전{where}) — "
+            f"멈춘 세션이면 `tasks.py release {item['id']} --force`로 놓는다"
+        )
+    return lines
+
+
+def open_failures(comments):
+    """Return [(who, what)] for 실패 comments after the last 막음 on one issue."""
+    found = []
+    for comment in sorted(comments or [], key=comment_key):
+        keyword, value = head_of(comment)
+        if keyword == "막음":
+            found = []
+        elif keyword == "실패":
+            found.append((value, fields_of(comment).get("무엇") or "내용 미기록"))
+    return found
+
+
+def failure_lines(issues, ticker, offset):
+    """Lines for failures not yet blocked, oldest issue first."""
+    lines = []
+    for issue in sorted(issues or [], key=lambda i: i["number"]):
+        tid = ticker_of(issue.get("title"), ticker)[0] or f"{ticker}-{issue['number'] + offset}"
+        lines += [f"- {tid}: {cell(what)} ({who})" for who, what in open_failures(issue.get("comments"))]
+    return lines
+
+
+def item_of(issue, ticker, offset):
+    tid, title = ticker_of(issue.get("title"), ticker)
+    names = label_names(issue)
+    form = parse_form(issue.get("body"))
+    text, meta = (form.get("text", ""), form) if form is not None else parse_body(issue.get("body"))
+    turn = label_value(names, "차례") or "미정"
+    if turn == "대기":
+        turn = "대기: " + (meta.get("대기") or "조건 미기록")
+    grade = "-" if turn == "사용자" else (label_value(names, "등급") or "-")
+    info = claim_info(issue.get("comments"))
+    holder, note = info["holder"], info["note"]
+    order = meta.get("순서", "")
+    return {
+        "number": issue["number"],
+        "id": tid or f"{ticker}-{issue['number'] + offset}",
+        "named": bool(tid),
+        "title": title,
+        "text": text or title,
+        "kind": label_value(names, "구분") or "-",
+        "grade": grade,
+        "turn": turn,
+        "order": int(order) if order.isdigit() else None,
+        "active": ACTIVE in names or holder is not None,
+        "holder": holder,
+        "branch": info["branch"],
+        "worktree": info["worktree"],
+        "claimed_at": info["claimed_at"],
+        "activity_at": info["activity_at"],
+        "stopped": note.get("멈춘 곳") or (f"막 잡음 ({holder})" if holder else "-"),
+        "next": note.get("다음 걸음") or "-",
+    }
+
+
+def id_number(tid):
+    return int(tid.rsplit("-", 1)[1])
+
+
+def sort_items(items):
+    return sorted(items, key=lambda i: (i["order"] is None, i["order"] or 0, id_number(i["id"])))
+
+
+def cell(text):
+    return " ".join((text or "").split()).replace("|", "\\|")
+
+
+def tasks_table(items):
+    rows = ["| 번호 | 구분 | 할 일 | 등급 | 차례 |", "|---|---|---|---|---|"]
+    rows += [f"| {i['id']} | {cell(i['kind'])} | {cell(i['text'])} | {i['grade']} | {cell(i['turn'])} |"
+             for i in sort_items(items)]
+    return "\n".join(rows)
+
+
+def summary_table(items):
+    """The one-off table for the session start: titles and meta only, no task text."""
+    rows = ["| 번호 | 제목 | 구분 | 등급 | 차례 |", "|---|---|---|---|---|"]
+    rows += [f"| {i['id']} | {cell(i['title'] or i['text'])} | {cell(i['kind'])} | {i['grade']} | {cell(i['turn'])} |"
+             for i in sort_items(items)]
+    return "\n".join(rows)
+
+
+def active_table(items):
+    rows = ["| 번호 | 하는 일 | 멈춘 곳 | 다음 걸음 |", "|---|---|---|---|"]
+    rows += [f"| {i['id']} | {cell(i['title'])} | {cell(i['stopped'])} | {cell(i['next'])} |"
+             for i in sort_items(items) if i["active"]]
+    return "\n".join(rows)
+
+
+def block_pattern(name):
+    return re.compile(rf"(<!-- tasks\.py:{re.escape(name)} 시작[^>]*-->)(.*?)(<!-- tasks\.py:{re.escape(name)} 끝 -->)", re.S)
+
+
+def has_block(text, name):
+    return bool(block_pattern(name).search(text))
+
+
+def replace_block(text, name, table):
+    """Replace the table between the tasks.py markers named name."""
+    if not has_block(text, name):
+        raise ValueError(f"'{name}' 사본 표시를 찾지 못함")
+    return block_pattern(name).sub(lambda m: f"{m.group(1)}\n\n{table}\n\n{m.group(3)}", text, count=1)
+
+
+def landed_ids(text, ticker):
+    return set(re.findall(rf"^\|\s*({re.escape(ticker)}-\d+)\s*\|", text, re.M))
+
+
+PLACEHOLDER = re.compile(r"\(요약 없음, 이슈 #\d+\)")
+
+
+def placeholder_ids(text, ticker):
+    """Ids of LANDED rows written before the closing comment arrived."""
+    return {m.group(1) for m in re.finditer(rf"^\|\s*({re.escape(ticker)}-\d+)\s*\|(.*)$", text, re.M)
+            if PLACEHOLDER.search(m.group(2))}
+
+
+def kst_day(stamp):
+    if not stamp:
+        return date.today().isoformat()
+    return datetime.fromisoformat(stamp.replace("Z", "+00:00")).astimezone(KST).date().isoformat()
+
+
+def landed_entry(issue, ticker, offset):
+    """Return (id, day, change, model, now, warning) for a closed issue."""
+    item = item_of(issue, ticker, offset)
+    change, model, now, warning = None, "-", "", ""
+    for comment in sorted(issue.get("comments") or [], key=comment_key):
+        keyword, value = head_of(comment)
+        fields = fields_of(comment)
+        if keyword == "끝":
+            change, model, now = fields.get("바뀐 것") or item["title"], value or "-", fields.get("지금 반영", "")
+        elif keyword == "취소":
+            change, model, now = "취소: " + (fields.get("이유") or "이유 미기록"), "-", ""
+        elif keyword == REOPENED:
+            change, model, now = None, "-", ""
+    if change is None:
+        change = f"{item['title']} (요약 없음, 이슈 #{issue['number']})"
+        warning = f"{item['id']}: 닫는 댓글(끝·취소)이 없어 제목으로 적었다"
+    return item["id"], kst_day(issue.get("closedAt")), change, model, now, warning
+
+
+def insert_landed(text, rows):
+    """Insert rows (id, day, change, model) at the top of the LANDED table, keeping their order."""
+    lines = text.split("\n")
+    for index, line in enumerate(lines[:-1]):
+        if re.match(r"^\|\s*번호\s*\|\s*날짜\s*\|", line) and set(lines[index + 1].replace("|", "").strip()) <= {"-", " "}:
+            lines[index + 2:index + 2] = [f"| {i} | {d} | {cell(c)} | {cell(m)} |" for i, d, c, m in rows]
+            return "\n".join(lines)
+    raise ValueError("LANDED 표를 찾지 못함")
+
+
+def update_landed(text, rows):
+    """Rewrite the existing LANDED rows for these ids in place: rows are (id, day, change, model)."""
+    wanted = {i: f"| {i} | {d} | {cell(c)} | {cell(m)} |" for i, d, c, m in rows}
+    lines = text.split("\n")
+    for index, line in enumerate(lines):
+        match = re.match(r"^\|\s*([^|\s]+)\s*\|", line)
+        if match and match.group(1) in wanted:
+            lines[index] = wanted.pop(match.group(1))
+    return "\n".join(lines)
+
+
+def drop_landed(text, ids):
+    """Remove the LANDED rows of these ids (tasks that were reopened)."""
+    return "\n".join(line for line in text.split("\n")
+                     if not (re.match(r"^\|\s*([^|\s]+)\s*\|", line) and line.split("|")[1].strip() in ids))
+
+
+# ---------- git·gh ----------
+
+def git(*args, cwd=None):
+    done = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, encoding="utf-8")
+    return done.stdout.strip() if done.returncode == 0 else None
+
+
+def toplevel(cwd=None):
+    return Path(git("rev-parse", "--show-toplevel", cwd=cwd) or (cwd or Path.cwd()))
+
+
+def git_dir(cwd=None):
+    found = git("rev-parse", "--path-format=absolute", "--git-dir", cwd=cwd)
+    return Path(found) if found else Path(cwd or toplevel(cwd)) / ".git"
+
+
+def session_path(cwd=None):
+    """Per-worktree session state file under this worktree's own git dir."""
+    return git_dir(cwd) / "tasks-session.json"
+
+
+def load_session(cwd=None):
+    try:
+        data = json.loads(session_path(cwd).read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_session(who, ref=None, cwd=None, issue_number=None):
+    data = {"who": who}
+    if ref:
+        data["ref"] = ref
+        if issue_number is not None:
+            data["issue_number"] = issue_number
+    try:
+        path = session_path(cwd)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write_text(path, json.dumps(data, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def clear_session_ref(tid, cwd=None):
+    session = load_session(cwd)
+    if session.get("who") and session.get("ref") == tid:
+        save_session(session["who"], ref=None, cwd=cwd)
+
+
+def resolve_ref(args_ref, cwd=None):
+    ref = args_ref or load_session(cwd).get("ref")
+    if not ref:
+        raise SystemExit("이 워크트리에서 잡은 일이 없다. 할 일 번호를 함께 준다")
+    return ref
+
+
+def session_issue(session, ref):
+    tid, number = session.get("ref"), session.get("issue_number")
+    if isinstance(tid, str) and type(number) is int and number > 0:
+        if ref.strip() in (tid, tid.rsplit("-", 1)[-1], f"#{number}"):
+            return number
+    return None
+
+
+def common_dir(cwd=None):
+    found = git("rev-parse", "--path-format=absolute", "--git-common-dir", cwd=cwd)
+    return Path(found) if found else None
+
+
+def main_folder(cwd=None):
+    """The main worktree folder: the parent of the shared .git directory."""
+    shared = common_dir(cwd)
+    return shared.parent if shared else Path(cwd or toplevel())
+
+
+def in_linked_worktree(cwd=None):
+    own = git("rev-parse", "--path-format=absolute", "--git-dir", cwd=cwd)
+    shared = common_dir(cwd)
+    return bool(own and shared and Path(own).resolve() != shared.resolve())
+
+
+def default_branch(cwd=None):
+    """The default branch name from origin/HEAD, else origin/main or origin/master."""
+    head = git("symbolic-ref", "--short", "refs/remotes/origin/HEAD", cwd=cwd)
+    if head and "/" in head:
+        return head.split("/", 1)[1]
+    for name in ("main", "master"):
+        if git("rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{name}", cwd=cwd):
+            return name
+    return None
+
+
+def check_main(cwd=None, pull=False):
+    """Stop unless the main folder is on the default branch and not behind origin. Returns a notice or ''."""
+    if not git("remote", "get-url", "origin", cwd=cwd):
+        return "origin 원격이 없어 기본 브랜치 확인을 건너뛰었다"
+    fetched = git("fetch", "--quiet", "origin", cwd=cwd) is not None
+    branch = default_branch(cwd)
+    if not branch:
+        return "origin의 기본 브랜치를 찾지 못해 확인을 건너뛰었다"
+    current = git("branch", "--show-current", cwd=cwd)
+    if current != branch:
+        raise SystemExit(f"sync는 주 폴더의 기본 브랜치({branch})에서 한다. 지금: {current or 'detached HEAD'}. "
+                         f"`git switch {branch}` 뒤 다시 sync한다")
+    behind = int(git("rev-list", "--count", f"HEAD..origin/{branch}", cwd=cwd) or 0)
+    if behind and not pull:
+        raise SystemExit(f"주 폴더가 origin/{branch}보다 {behind}커밋 뒤처졌다. 뒤처진 채 사본을 쓰면 ship의 직접 푸시가 "
+                         f"거절된다. `git pull --ff-only` 뒤 다시 sync하거나 `tasks.py sync --pull`을 쓴다")
+    if behind:
+        if git("pull", "--ff-only", "--quiet", "origin", branch, cwd=cwd) is None:
+            raise SystemExit(f"`git pull --ff-only origin {branch}`가 실패했다. 주 폴더의 갈라짐이나 고친 파일을 먼저 정리한다")
+        print(f"origin/{branch}의 {behind}커밋을 받았다")
+    return "" if fetched else f"origin을 받지 못해 마지막으로 받은 origin/{branch}와 비교했다"
+
+
+class GH:
+    def __init__(self, cwd, timeout=30):
+        self.cwd, self.timeout = str(cwd), timeout
+
+    def run(self, *args, stdin=None):
+        try:
+            done = subprocess.run(["gh", *args], cwd=self.cwd, capture_output=True, text=True, encoding="utf-8",
+                                  timeout=self.timeout, input=stdin)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise GhError(str(error)) from error
+        if done.returncode != 0:
+            raise GhError((done.stderr or done.stdout).strip())
+        if args[:2] == ("issue", "close") and "--comment" in args:
+            return done.stdout + done.stderr
+        return done.stdout
+
+    def list(self, state, fields, *extra, limit=200):
+        """List issues, raising the limit until the answer is shorter than it, so nothing is cut at a fixed cap."""
+        while True:
+            found = json.loads(self.run("issue", "list", "--state", state, "--limit", str(limit), "--json", fields, *extra) or "[]")
+            if len(found) < limit:
+                return found
+            limit *= 4
+
+    def issues(self, state):
+        """Issues with bodies and comments. Use for open issues; closed ones go through brief() and issue()."""
+        return self.list(state, FIELDS)
+
+    def brief(self, state):
+        """Issues without bodies and comments."""
+        return self.list(state, BRIEF)
+
+    def issue(self, number):
+        return json.loads(self.run("issue", "view", str(number), "--json", FIELDS))
+
+    def failed(self):
+        """Open and closed issues that still carry the 막을 것 label."""
+        return self.list("all", FIELDS, "--label", FAILED)
+
+    def graph_repository(self, query):
+        raw = self.run("api", "graphql", "-F", "owner={owner}", "-F", "name={repo}", "-f", "query=" + query)
+        return json.loads(raw)["data"]["repository"]
+
+    def open_and_failed(self):
+        try:
+            data = self.graph_repository(OPEN_AND_FAILED)
+            return issue_connection(data["opened"]), issue_connection(data["failed"])
+        except (GhError, ValueError, KeyError, TypeError):
+            # Larger repositories use the same paged listing as the individual commands.
+            with ThreadPoolExecutor(max_workers=2) as workers:
+                opened = workers.submit(self.issues, "open")
+                failures = workers.submit(self.failed)
+                return opened.result(), failures.result()
+
+    def issue_details(self, numbers):
+        details = {}
+        for start in range(0, len(numbers), 50):
+            batch = numbers[start:start + 50]
+            if len(batch) == 1:
+                details[batch[0]] = self.issue(batch[0])
+                continue
+            selections = "\n".join(f"i{n}:issue(number:{n}) {{ ...TaskIssue }}" for n in batch)
+            query = (
+                "query($owner:String!, $name:String!) { repository(owner:$owner, name:$name) {\n"
+                + selections + "\n} }\nfragment TaskIssue on Issue {" + ISSUE_FIELDS + "}"
+            )
+            try:
+                data = self.graph_repository(query)
+            except (GhError, ValueError, KeyError, TypeError):
+                data = {}
+            for number in batch:
+                try:
+                    details[number] = flatten_issue(data[f"i{number}"])
+                except (ValueError, KeyError, TypeError):
+                    details[number] = self.issue(number)
+        return details
+
+    def comment(self, number, body):
+        self.run("issue", "comment", str(number), "--body-file", "-", stdin=body)
+
+    def edit(self, number, *args, stdin=None):
+        self.run("issue", "edit", str(number), *args, stdin=stdin)
+
+    def labels(self):
+        return {label["name"] for label in json.loads(self.run("label", "list", "--limit", "500", "--json", "name") or "[]")}
+
+    def ensure_labels(self, names):
+        have = self.labels()
+        for name in names:
+            if name not in have:
+                try:
+                    self.run("label", "create", name, "--color", LABEL_COLORS.get(name.split(":", 1)[0], "ededed"))
+                except GhError as error:
+                    # 다른 세션이 같은 라벨을 먼저 만들었으면 그대로 쓴다.
+                    if "already exists" not in str(error):
+                        raise
+
+
+def missing_label(error):
+    # gh: "could not add label: 'x' not found"
+    return "not found" in str(error).lower()
+
+
+def with_labels(gh, labels, call):
+    """Run call; only when GitHub says a label is missing, make the labels and run it again.
+
+    Labels exist after the first use, so the common case asks GitHub nothing extra.
+    """
+    try:
+        return call()
+    except GhError as error:
+        if not missing_label(error):
+            raise
+        gh.ensure_labels(labels)
+        return call()
+
+
+def cache_path(cwd=None):
+    shared = common_dir(cwd)
+    return (shared if shared else Path(cwd or toplevel()) / ".git") / "tasks-cache.json"
+
+
+def issue_connection(connection):
+    if any(connection["pageInfo"].values()):
+        raise ValueError("이슈가 한 페이지보다 많음")
+    return [flatten_issue(issue) for issue in connection["nodes"]]
+
+
+def flatten_issue(issue):
+    result = dict(issue)
+    for field in ("labels", "comments"):
+        connection = issue[field]
+        if any(connection["pageInfo"].values()):
+            raise ValueError(f"이슈 #{issue['number']}의 {field}가 한 페이지보다 많음")
+        result[field] = connection["nodes"]
+    return result
+
+
+def read_cache(path):
+    try:
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        age = datetime.now(KST) - datetime.fromisoformat(saved["at"])
+        return saved["issues"], saved.get("failures", []), age.total_seconds()
+    except (OSError, ValueError, TypeError, KeyError):
+        return None
+
+
+def write_cache(path, issues, failed):
+    temporary = None
+    try:
+        saved = {"at": datetime.now(KST).isoformat(), "issues": issues, "failures": failed}
+        with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, encoding="utf-8", delete=False) as handle:
+            temporary = Path(handle.name)
+            json.dump(saved, handle, ensure_ascii=False)
+        temporary.replace(path)
+    except OSError:
+        if temporary:
+            temporary.unlink(missing_ok=True)
+
+
+def fetch_open(gh, offline=False, cwd=None, prefer_cache=False, path=None):
+    """Return (open issues or None, issues with unblocked failures, notice).
+
+    Falls back to the last copy when GitHub is unreachable.
+    """
+    path = path or cache_path(cwd)
+    if prefer_cache and not offline:
+        cached = read_cache(path)
+        if cached and 0 <= cached[2] < CACHE_TTL_SECONDS:
+            return cached[0], cached[1], ""
+    error = "오프라인으로 요청함"
+    if not offline:
+        try:
+            issues, failed = gh.open_and_failed()
+            write_cache(path, issues, failed)
+            return issues, failed, ""
+        except GhError as failure:
+            error = str(failure).splitlines()[0] if str(failure) else "gh 실패"
+    cached = read_cache(path)
+    if cached is None:
+        return None, [], f"이슈를 받지 못했고 저장한 사본도 없다 ({error})"
+    issues, failed, age = cached
+    return issues, failed, f"이슈를 받지 못해 {int(age // 60)}분 전 사본을 보인다 ({error})"
+
+
+def print_failures(failed, ticker, offset):
+    lines = failure_lines(failed, ticker, offset)
+    if lines:
+        print("\n막지 않은 실패 (같은 실패를 되풀이하지 않게 먼저 읽고, 막을 수 있으면 막는다):")
+        print("\n".join(lines))
+
+
+def print_stale_claims(items, now=None, hours=STALE_HOURS):
+    lines = stale_claim_lines(items, now=now, hours=hours)
+    if lines:
+        print(f"\n오래된 선점 ({hours}시간 이상 갱신 없음):")
+        print("\n".join(lines))
+
+
+def write_text(path, text):
+    with open(path, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(text)
+
+
+def resolve(gh, ref, ticker, offset):
+    """Return the issue for `<ticker>-n`, `n` (ticker number) or `#n` (issue number)."""
+    ref = ref.strip()
+    if ref.startswith("#"):
+        return gh.issue(int(ref[1:]))
+    number = id_number(ref) if "-" in ref else int(ref)
+    want = f"{ticker}-{number}"
+    guess = number - offset
+    if guess > 0:
+        try:
+            issue = gh.issue(guess)
+            if ticker_of(issue["title"], ticker)[0] == want:
+                return issue
+        except GhError:
+            pass
+    for issue in gh.brief("all"):
+        if ticker_of(issue["title"], ticker)[0] == want:
+            return gh.issue(issue["number"])
+    raise SystemExit(f"{want} 이슈를 찾지 못함")
+
+
+def load_overdue():
+    spec = importlib.util.spec_from_file_location("overdue", SCRIPTS / "overdue.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+# ---------- 명령 ----------
+
+def detail_lines(issue, ticker, offset, now=None):
+    """Lines describing one issue: the full task text, turn, holder, note and unblocked failures."""
+    item = item_of(issue, ticker, offset)
+    lines = [f"## {item['id']} (#{issue['number']}, {issue.get('state', '')}) {item['title']}", "", item["text"], "",
+             f"- 구분: {item['kind']} · 등급: {item['grade']} · 차례: {item['turn']}",
+             f"- 잡은 세션: {item['holder'] or '-'} · 멈춘 곳: {item['stopped']} · 다음 걸음: {item['next']}"]
+    loc = [f"{k}: {item[f]}" for k, f in (("브랜치", "branch"), ("워크트리", "worktree"), ("시각", "claimed_at")) if item.get(f)]
+    if loc:
+        lines.append("- 선점 정보: " + " · ".join(loc))
+    age = claim_age_hours(item, now=now)
+    if age is not None and age >= STALE_HOURS:
+        lines.append(f"- 오래된 선점: {int(age)}시간 전 — 멈춘 세션이면 `tasks.py release {item['id']} --force`로 놓는다")
+    lines += [f"- 막지 않은 실패: {what} ({who})" for who, what in open_failures(issue.get("comments"))]
+    return lines
+
+
+def cmd_show(args, gh, ticker, offset, cwd=None):
+    if args.ref:
+        cached = read_cache(cache_path(cwd))
+        if cached and (args.offline or 0 <= cached[2] < CACHE_TTL_SECONDS):
+            ref = args.ref.strip()
+            number = int(ref[1:] if ref.startswith("#") else ref.rsplit("-", 1)[-1])
+            for issue in cached[0] + cached[1]:
+                tid = item_of(issue, ticker, offset)["id"]
+                if (ref.startswith("#") and issue["number"] == number) or (
+                    not ref.startswith("#") and tid == f"{ticker}-{number}"
+                ):
+                    if args.offline:
+                        print(f"> {int(cached[2] // 60)}분 전 사본을 보인다 (오프라인으로 요청함)\n")
+                    print("\n".join(detail_lines(issue, ticker, offset)))
+                    return
+        if args.offline:
+            raise SystemExit("저장한 사본에서 이슈를 찾지 못함")
+        print("\n".join(detail_lines(resolve(gh, args.ref, ticker, offset), ticker, offset)))
+        return
+    issues, failed, notice = fetch_open(gh, args.offline, cwd, prefer_cache=True)
+    if issues is None:
+        raise SystemExit(notice)
+    items = [item_of(issue, ticker, offset) for issue in issues if is_task(issue, ticker)]
+    if notice:
+        print(f"> {notice}\n")
+    print("## 일회성\n\n" + tasks_table(items) + "\n\n## 진행 중\n\n" + active_table(items))
+    print_stale_claims(items)
+    print_failures(failed, ticker, offset)
+
+
+def cmd_hook(args, gh, ticker, offset, cwd=None):
+    """Print what a session needs at start: a short table, what is held, failures and overdue items.
+
+    The task text and the usage header of TASKS.md are left out; `show <번호>` prints one task in full.
+    """
+    path = cache_path(cwd)
+    main = path.parent.parent
+    text = (main / "TASKS.md").read_text(encoding="utf-8")
+    issues, failed, notice = fetch_open(gh, args.offline, path=path)
+    if notice:
+        print(f"> {notice}\n")
+    if issues is not None:
+        items = [item_of(issue, ticker, offset) for issue in issues if is_task(issue, ticker)]
+        table = summary_table(items)
+        print(f"## 일회성 (열린 이슈 {len(items)}개, 위가 먼저)\n\n{table}")
+    else:
+        # 이슈도 저장한 사본도 없으면 파일의 사본 표를 그대로 보인다.
+        items = []
+        found = block_pattern("일회성").search(text)
+        table = found.group(2).strip() if found else ""
+        print("## 일회성 (TASKS.md 사본)\n\n" + (table or "(사본 표 없음)"))
+    print("\n할 일 전체와 끝 조건: `tasks.py show <번호>`. 명령은 TASKS.md '일회성' 머리말.")
+    print("\n## 진행 중 (이슈)\n\n" + active_table(items))
+    print_stale_claims(items)
+    if Path(cwd or toplevel()).resolve() != main.resolve():
+        print(f"\n> 이 폴더는 worktree다. TASKS.md·STATE.md·LANDED.md를 고치지 않는다. 주 폴더: {main}")
+    print_failures(failed, ticker, offset)
+    overdue = load_overdue()
+    due = overdue.due_items(text, date.today())
+    waits = overdue.passed_waits("## 일회성\n\n" + table, datetime.now())
+    if due:
+        print("\n밀린 주기적 항목:")
+        for task, reason in due:
+            print(f"- {task} ({reason})")
+    if waits:
+        print("\n날짜가 지난 대기 항목:")
+        for number, turn in waits:
+            print(f"- {number} ({turn})")
+
+
+def task_copy_warning(root):
+    scripts = root / "scripts"
+    if not (scripts / "tasks.json").is_file():
+        return ""
+    try:
+        source = (scripts / "tasks.py").read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return ""
+    marker = re.search(r"^TASKS_SCRIPT_VERSION\s*=\s*([0-9]+)\s*(?:#.*)?$", source, re.MULTILINE)
+    version = int(marker[1]) if marker else 0
+    if version < TASKS_SCRIPT_VERSION:
+        return "저장소의 scripts/tasks.py 사본이 jk-template 공통본보다 오래됐다. 주 폴더에서 install_tasks.py --upgrade로 갱신한다."
+    return ""
+
+
+def cmd_add(args, gh, ticker, offset):
+    if args.turn == "대기" and not args.wait:
+        raise SystemExit("차례가 대기면 --wait에 조건을 적는다")
+    order = args.order
+    if order is None:
+        # 순서만 보면 되므로 본문만 받는다(댓글·라벨은 받지 않는다).
+        orders = [parse_body(i.get("body"))[1].get("순서", "") for i in gh.list("open", "number,body")]
+        order = max([int(o) for o in orders if o.isdigit()] or [0]) + 10
+    labels = [f"구분:{args.kind}", f"등급:{args.grade}", f"차례:{args.turn}"]
+    body = make_body(args.text, {"순서": order, "대기": args.wait})
+    title = f"{args.id} {args.title}" if args.id else args.title
+    url = with_labels(gh, labels, lambda: gh.run("issue", "create", "--title", title, "--body-file", "-",
+                                                 "--label", ",".join(labels), stdin=body)).strip()
+    number = int(url.rstrip("/").rsplit("/", 1)[1])
+    tid = args.id or f"{ticker}-{number + offset}"
+    if not args.id:
+        gh.edit(number, "--title", f"{tid} {args.title}")
+    print(f"{tid} (#{number}) {url}")
+
+
+def cmd_edit(args, gh, ticker, offset):
+    issue = resolve(gh, args.ref, ticker, offset)
+    tid = item_of(issue, ticker, offset)["id"]
+    named = ticker_of(issue.get("title"), ticker)[0]
+    flags, add, body = [], [], None
+    if args.title:
+        flags += ["--title", f"{named} {args.title}" if named else args.title]
+    if args.text is not None or args.order is not None:
+        text, meta = parse_body(issue.get("body"))
+        if args.text is not None:
+            text = args.text
+        if args.order is not None:
+            meta["순서"] = args.order
+        body = make_body(text, meta)
+        flags += ["--body-file", "-"]
+    if args.kind:
+        add = [f"구분:{args.kind}"]
+        old = [n for n in label_names(issue) if n.startswith("구분:") and n not in add]
+        flags += ["--add-label", add[0]] + (["--remove-label", ",".join(old)] if old else [])
+    if not flags:
+        raise SystemExit("바꿀 것이 없다: --title, --text, --kind, --order 중 하나 이상을 준다")
+    with_labels(gh, add, lambda: gh.edit(issue["number"], *flags, stdin=body))
+    print(f"{tid}을 고쳤다")
+
+
+def cmd_claim(args, gh, ticker, offset, cwd=None):
+    issue = resolve(gh, args.ref, ticker, offset)
+    tid = item_of(issue, ticker, offset)["id"]
+    if issue["state"] != "OPEN":
+        raise SystemExit(f"{tid}은 닫혀 있다")
+    session = load_session(cwd)
+    root = toplevel(cwd)
+    who = args.who or session.get("who") or f"{root.name}-{secrets.token_hex(2)}"
+    info = claim_info(issue["comments"])
+    holder = info["holder"]
+    if holder == who:
+        save_session(who, ref=tid, cwd=cwd, issue_number=issue["number"])
+        print(f"{tid}은 이미 {who}가 잡고 있다")
+        return
+    if holder:
+        extra = f" (브랜치: {info['branch']})" if info["branch"] else ""
+        age = claim_age_hours(info)
+        hint = (f". {int(age)}시간 전 선점이라 멈춘 세션이면 `tasks.py release {tid} --force` 뒤 다시 잡는다"
+                if age is not None and age >= STALE_HOURS else "")
+        raise SystemExit(f"{tid}은 {holder}{extra}가 잡고 있어 하지 않는다{hint}")
+    started = time.monotonic()
+    with_labels(gh, [ACTIVE], lambda: gh.edit(issue["number"], "--add-label", ACTIVE))
+    branch = git("branch", "--show-current", cwd=cwd) or "detached HEAD"
+    at = datetime.now(KST).isoformat(timespec="seconds")
+    gh.comment(issue["number"], f"잡음: {who}\n브랜치: {branch}\n워크트리: {root}\n시각: {at}")
+    save_session(who, ref=tid, cwd=cwd, issue_number=issue["number"])
+    time.sleep(max(0, args.settle - (time.monotonic() - started)))
+    holder, _ = claim_state(gh.issue(issue["number"])["comments"])
+    if holder != who:
+        save_session(session.get("who") or who, ref=session.get("ref"), cwd=cwd,
+                     issue_number=session.get("issue_number"))
+        raise SystemExit(f"{holder}가 먼저 잡았다. {tid}은 하지 않는다")
+    print(f"{tid} (#{issue['number']})을 잡았다. 이름: {who}")
+
+
+def cmd_note(args, gh, ticker, offset, cwd=None):
+    ref = resolve_ref(args.ref, cwd=cwd)
+    session = load_session(cwd)
+    number = session_issue(session, ref)
+    tid = session.get("ref")
+    who = args.who or session.get("who")
+    if number is None or not who:
+        issue = resolve(gh, ref, ticker, offset)
+        number = issue["number"]
+        tid = item_of(issue, ticker, offset)["id"]
+        holder, _ = claim_state(issue["comments"])
+        who = who or holder or "-"
+    gh.comment(number, f"메모: {who}\n멈춘 곳: {args.stopped}\n다음 걸음: {args.next}")
+    print(f"{tid}에 메모를 남겼다")
+
+
+def cmd_turn(args, gh, ticker, offset):
+    issue = resolve(gh, args.ref, ticker, offset)
+    turn, wait = args.turn, None
+    if turn.startswith("대기"):
+        turn, wait = "대기", turn.split(":", 1)[1].strip() if ":" in turn else ""
+        if not wait:
+            raise SystemExit('대기는 "대기: 조건"으로 준다')
+    if turn not in TURNS:
+        raise SystemExit(f"차례는 {', '.join(TURNS)} 중 하나")
+    names = label_names(issue)
+    add = [f"차례:{turn}"] + ([f"등급:{args.grade}"] if args.grade else [])
+    drop = [n for n in names if (n.startswith("차례:") or (args.grade and n.startswith("등급:"))) and n not in add]
+    labels = ["--add-label", ",".join(add)] + (["--remove-label", ",".join(drop)] if drop else [])
+    text, meta = parse_body(issue.get("body"))
+    meta["대기"] = wait
+    # 본문이 `-`로 시작하거나 길어도 깨지지 않게 인자가 아닌 stdin으로 넘긴다.
+    with_labels(gh, add, lambda: gh.edit(issue["number"], *labels, "--body-file", "-", stdin=make_body(text, meta)))
+    print(f"{item_of(issue, ticker, offset)['id']} 차례: {args.turn}")
+
+
+def cmd_release(args, gh, ticker, offset, cwd=None):
+    ref = resolve_ref(args.ref, cwd=cwd)
+    issue = resolve(gh, ref, ticker, offset)
+    tid = item_of(issue, ticker, offset)["id"]
+    holder, _ = claim_state(issue["comments"])
+    who = args.who or load_session(cwd).get("who")
+    if holder and who != holder and not args.force:
+        raise SystemExit(f"{holder}가 잡은 일이다. 놓으려면 --who {holder} 또는 --force")
+    gh.comment(issue["number"], f"놓음: {who or holder or '-'}")
+    if ACTIVE in label_names(issue):
+        gh.edit(issue["number"], "--remove-label", ACTIVE)
+    clear_session_ref(tid, cwd=cwd)
+    print(f"{tid}을 놓았다")
+
+
+def finish(gh, issue, body, reason):
+    gh.comment(issue["number"], body)
+    if ACTIVE in label_names(issue):
+        gh.edit(issue["number"], "--remove-label", ACTIVE)
+    if issue["state"] == "OPEN":
+        gh.run("issue", "close", str(issue["number"]), "--reason", reason)
+
+
+def cmd_close(args, gh, ticker, offset, cwd=None):
+    session = load_session(cwd)
+    number = session_issue(session, args.ref)
+    if number is None:
+        issue = resolve(gh, args.ref, ticker, offset)
+        number = issue["number"]
+        tid = item_of(issue, ticker, offset)["id"]
+        closed = issue["state"] != "OPEN"
+        active = ACTIVE in label_names(issue)
+    else:
+        tid = session["ref"]
+        closed, active = False, True
+    body = f"끝: {args.model}\n바뀐 것: {' '.join(args.summary.split())}"
+    if args.now:
+        body += f"\n지금 반영: {' '.join(args.now.split())}"
+    if not closed:
+        output = gh.run("issue", "close", str(number), "--reason", "completed", "--comment", body)
+        # gh does not post the comment if it finds the issue already closed.
+        closed = any(line.rstrip().endswith(" is already closed") for line in output.splitlines())
+    if closed:
+        gh.comment(number, body)
+    if active:
+        try:
+            gh.edit(number, "--remove-label", ACTIVE)
+        except GhError as error:
+            if not missing_label(error):
+                raise
+    clear_session_ref(tid, cwd=cwd)
+    already = " (이미 닫힌 이슈라 댓글만 남겼다)" if closed else ""
+    print(f"{tid}을 끝냈다{already}. LANDED.md는 주 폴더의 sync가 채운다")
+
+
+def cmd_cancel(args, gh, ticker, offset, cwd=None):
+    issue = resolve(gh, args.ref, ticker, offset)
+    tid = item_of(issue, ticker, offset)["id"]
+    finish(gh, issue, f"취소: {args.who or '-'}\n이유: {' '.join(args.reason.split())}", "not planned")
+    clear_session_ref(tid, cwd=cwd)
+    print(f"{tid}을 취소했다. LANDED.md는 주 폴더의 sync가 채운다")
+
+
+def cmd_reopen(args, gh, ticker, offset):
+    issue = resolve(gh, args.ref, ticker, offset)
+    tid = item_of(issue, ticker, offset)["id"]
+    if issue["state"] == "OPEN":
+        raise SystemExit(f"{tid}은 이미 열려 있다")
+    gh.run("issue", "reopen", str(issue["number"]))
+    gh.comment(issue["number"], f"{REOPENED}: {args.who or '-'}\n이유: {' '.join(args.reason.split())}")
+    print(f"{tid}을 다시 열었다. 주 폴더의 sync가 LANDED.md에서 그 행을 빼고 표에 되돌린다")
+
+
+def cmd_fail(args, gh, ticker, offset):
+    issue = resolve(gh, args.ref, ticker, offset)
+    holder, _ = claim_state(issue["comments"])
+    gh.comment(issue["number"], f"실패: {args.who or holder or '-'}\n무엇: {' '.join(args.what.split())}")
+    if FAILED not in label_names(issue):
+        with_labels(gh, [FAILED], lambda: gh.edit(issue["number"], "--add-label", FAILED))
+    print(f"{item_of(issue, ticker, offset)['id']}에 실패를 남겼다. 막으면 tasks.py fixed로 지운다")
+
+
+def cmd_fixed(args, gh, ticker, offset):
+    issue = resolve(gh, args.ref, ticker, offset)
+    if not open_failures(issue["comments"]):
+        raise SystemExit(f"{item_of(issue, ticker, offset)['id']}에 막지 않은 실패가 없다")
+    gh.comment(issue["number"], f"막음: {args.who or '-'}\n어떻게: {' '.join(args.how.split())}")
+    if FAILED in label_names(issue):
+        gh.edit(issue["number"], "--remove-label", FAILED)
+    print(f"{item_of(issue, ticker, offset)['id']}의 실패를 막음으로 적었다")
+
+
+def cmd_sync(args, gh, ticker, offset, cwd=None):
+    if in_linked_worktree(cwd):
+        raise SystemExit(f"sync는 주 폴더에서만 한다: {main_folder(cwd)}")
+    root = main_folder(cwd)
+    notice = check_main(root, pull=getattr(args, "pull", False))
+    if notice:
+        print(f"> {notice}")
+    paths = {name: root / name for name in ("TASKS.md", "STATE.md", "LANDED.md")}
+    texts = {name: path.read_text(encoding="utf-8") for name, path in paths.items()}
+    have, waiting = landed_ids(texts["LANDED.md"], ticker), placeholder_ids(texts["LANDED.md"], ticker)
+    every = gh.brief("all")
+    numbers = []
+    for issue in every:
+        number = issue["number"]
+        tid = ticker_of(issue["title"], ticker)[0] or f"{ticker}-{number + offset}"
+        if FAILED in label_names(issue) or (
+            is_task(issue, ticker) and (issue["state"] == "OPEN" or tid not in have or tid in waiting)
+        ):
+            numbers.append(number)
+    details = gh.issue_details(numbers)
+    every = [details.get(issue["number"], issue) for issue in every]
+    failed = [issue for issue in every if FAILED in label_names(issue)]
+    open_issues = [issue for issue in every if issue["state"] == "OPEN" and is_task(issue, ticker)]
+    closed = [issue for issue in every if issue["state"] == "CLOSED" and is_task(issue, ticker)]
+    skipped = len(every) - len(open_issues) - len(closed)
+    for issue in open_issues + closed:
+        tid, title = ticker_of(issue["title"], ticker)
+        if not tid:
+            tid = f"{ticker}-{issue['number'] + offset}"
+            gh.edit(issue["number"], "--title", f"{tid} {title}")
+            issue["title"] = f"{tid} {title}"
+            print(f"번호 붙임: #{issue['number']} → {tid}")
+    for issue in open_issues:
+        fixed = form_fix(issue)
+        if not fixed:
+            continue
+        body, add, drop = fixed
+        flags = ["--body-file", "-"] + (["--add-label", ",".join(add)] if add else []) \
+            + (["--remove-label", ",".join(drop)] if drop else [])
+        with_labels(gh, add, lambda: gh.edit(issue["number"], *flags, stdin=body))
+        issue["body"] = body
+        kept = [n for n in label_names(issue) if n not in drop and n not in add]
+        issue["labels"] = [{"name": n} for n in kept + add]
+        print(f"양식 이슈 정리: {item_of(issue, ticker, offset)['id']} (본문·라벨)")
+    for issue in closed:
+        # `Closes #n`이 닫고 close가 아직 오지 않았거나 잊힌 이슈의 라벨
+        if ACTIVE in label_names(issue):
+            gh.edit(issue["number"], "--remove-label", ACTIVE)
+            print(f"진행중 라벨 지움: {item_of(issue, ticker, offset)['id']} (닫힌 이슈)")
+    items = [item_of(issue, ticker, offset) for issue in open_issues]
+    new = dict(texts)
+    new["TASKS.md"] = replace_block(texts["TASKS.md"], "일회성", tasks_table(items))
+    new["STATE.md"] = replace_block(texts["STATE.md"], "진행 중", active_table(items))
+    reopened = {i["id"] for i, issue in ((item_of(o, ticker, offset), o) for o in open_issues)
+                if i["id"] in have and any(head_of(c)[0] == REOPENED for c in issue.get("comments") or [])}
+    if reopened:
+        new["LANDED.md"] = drop_landed(new["LANDED.md"], reopened)
+        have -= reopened
+    full = [i for i in closed if item_of(i, ticker, offset)["id"] not in have or item_of(i, ticker, offset)["id"] in waiting]
+    entries = [landed_entry(issue, ticker, offset) for issue in sorted(full, key=lambda i: i.get("closedAt") or "", reverse=True)]
+    fresh = [e for e in entries if e[0] not in have]
+    healed = [e for e in entries if e[0] in waiting and not e[5]]
+    if healed:
+        new["LANDED.md"] = update_landed(new["LANDED.md"], [e[:4] for e in healed])
+    if fresh:
+        new["LANDED.md"] = insert_landed(new["LANDED.md"], [e[:4] for e in fresh])
+    changed = [name for name in paths if new[name] != texts[name]]
+    for name in changed:
+        write_text(paths[name], new[name])
+    print("바뀐 사본: " + (", ".join(changed) if changed else "없음"))
+    for tid in sorted(reopened, key=id_number):
+        print(f"LANDED에서 뺌: {tid} (다시 열림)")
+    if skipped:
+        print(f"할 일이 아닌 이슈 {skipped}개는 건너뛰었다(번호 제목도 구분·등급·차례 라벨도 없음). "
+              "할 일로 삼으려면 `tasks.py turn #이슈번호 AI`")
+    for tid, _, _, _, now, _ in fresh + healed:
+        if tid in waiting:
+            print(f"요약 채움: {tid} (닫는 댓글이 뒤에 왔다)")
+        if now:
+            print(f"STATE '지금'에 반영할 것 ({tid}): {now}")
+    for tid, *_ in [e for e in entries if e[5] and (e[0] not in have or e[0] in waiting)]:
+        print(f"확인: {tid}은 닫는 댓글(끝·취소)이 없어 LANDED에 제목으로 적었다. "
+              f"`tasks.py close {tid} --model ... --summary ...`(또는 cancel)로 남기면 다음 sync가 그 행을 고친다")
+    print_stale_claims(items)
+    print_failures(failed, ticker, offset)
+
+
+def parser():
+    top = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    sub = top.add_subparsers(dest="command", required=True)
+    show = sub.add_parser("show", help="이슈의 할 일과 진행 중을 표로 보인다. 번호를 주면 그 일 하나를 자세히 보인다")
+    show.add_argument("ref", nargs="?", help="<티커>-n, n 또는 #이슈번호")
+    show.add_argument("--offline", action="store_true")
+    hook = sub.add_parser("hook", help="세션 시작 출력")
+    hook.add_argument("--offline", action="store_true")
+    hook.add_argument("--check-copy", action="store_true", help="플러그인 훅에 오래된 스크립트 사본 경고만 보낸다")
+    add = sub.add_parser("add", help="할 일을 이슈로 만든다")
+    add.add_argument("text", help="무엇이 되면 끝인지까지 적은 할 일")
+    add.add_argument("--title", required=True)
+    add.add_argument("--kind", required=True, help="구분 (예: 경계, 순서)")
+    add.add_argument("--grade", required=True, choices=GRADES)
+    add.add_argument("--turn", default="AI", choices=TURNS)
+    add.add_argument("--wait", help="차례가 대기일 때의 조건")
+    add.add_argument("--order", type=int, help="작을수록 먼저. 없으면 맨 뒤")
+    add.add_argument("--id", help="옮겨 오는 항목의 기존 번호 (예: RAE-66)")
+    edit = sub.add_parser("edit", help="제목·할 일·구분·순서를 고친다")
+    edit.add_argument("ref")
+    edit.add_argument("--title", help="번호를 뺀 새 제목")
+    edit.add_argument("--text", help="무엇이 되면 끝인지까지 적은 새 할 일")
+    edit.add_argument("--kind", help="새 구분")
+    edit.add_argument("--order", type=int, help="새 순서. 작을수록 먼저")
+    claim = sub.add_parser("claim", help="일을 잡는다. 먼저 잡은 세션이 한다")
+    claim.add_argument("ref")
+    claim.add_argument("--who")
+    claim.add_argument("--settle", type=float, default=2.0, help="다른 세션의 잡음 댓글을 기다리는 초")
+    note = sub.add_parser("note", help="멈춘 곳과 다음 걸음을 남긴다")
+    note.add_argument("ref", nargs="?", help="생략하면 이 워크트리에서 잡은 일")
+    note.add_argument("--stopped", required=True)
+    note.add_argument("--next", required=True)
+    note.add_argument("--who")
+    turn = sub.add_parser("turn", help='차례를 바꾼다: AI, 사용자, "대기: 조건"')
+    turn.add_argument("ref")
+    turn.add_argument("turn")
+    turn.add_argument("--grade", choices=GRADES)
+    release = sub.add_parser("release", help="잡은 일을 놓는다")
+    release.add_argument("ref", nargs="?", help="생략하면 이 워크트리에서 잡은 일")
+    release.add_argument("--who")
+    release.add_argument("--force", action="store_true")
+    close = sub.add_parser("close", help="끝낸다")
+    close.add_argument("ref")
+    close.add_argument("--model", required=True)
+    close.add_argument("--summary", required=True, help="LANDED '바뀐 것'에 들어갈 한 문장")
+    close.add_argument("--now", help="STATE '지금'에 반영할 것")
+    cancel = sub.add_parser("cancel", help="취소한다")
+    cancel.add_argument("ref")
+    cancel.add_argument("--reason", required=True)
+    cancel.add_argument("--who")
+    reopen = sub.add_parser("reopen", help="잘못 닫은 일을 다시 연다. sync가 LANDED에서 그 행을 뺀다")
+    reopen.add_argument("ref")
+    reopen.add_argument("--reason", required=True)
+    reopen.add_argument("--who")
+    fail = sub.add_parser("fail", help="실패를 남긴다. 막을 때까지 훅·show·sync가 보인다")
+    fail.add_argument("ref")
+    fail.add_argument("--what", required=True, help="무엇이 왜 실패했나 한 문장")
+    fail.add_argument("--who")
+    fixed = sub.add_parser("fixed", help="이슈의 실패를 모두 막았다고 적는다")
+    fixed.add_argument("ref")
+    fixed.add_argument("--how", required=True, help="막은 방법: 테스트 이름·검사·함정 줄·커밋")
+    fixed.add_argument("--who")
+    sync = sub.add_parser("sync", help="주 폴더의 TASKS·STATE·LANDED 사본을 이슈에 맞춘다")
+    sync.add_argument("--pull", action="store_true", help="주 폴더가 origin보다 뒤처졌으면 git pull --ff-only로 받고 쓴다")
+    return top
+
+
+def main(argv=None):
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+    args = parser().parse_args(argv)
+    root = toplevel()
+    if args.command == "hook" and args.check_copy:
+        warning = task_copy_warning(root)
+        if warning:
+            print(json.dumps({"systemMessage": warning, "hookSpecificOutput": {
+                "hookEventName": "SessionStart", "additionalContext": warning,
+            }}, ensure_ascii=False))
+        return
+    ticker, offset = load_config(root / "scripts" / "tasks.json")
+    gh = GH(root, timeout=8 if args.command == "hook" else 30)
+    commands = {"show": cmd_show, "hook": cmd_hook, "add": cmd_add, "edit": cmd_edit, "claim": cmd_claim, "note": cmd_note,
+                "turn": cmd_turn, "release": cmd_release, "close": cmd_close, "cancel": cmd_cancel, "reopen": cmd_reopen,
+                "fail": cmd_fail, "fixed": cmd_fixed, "sync": cmd_sync}
+    try:
+        if args.command in ("hook", "show"):
+            commands[args.command](args, gh, ticker, offset, cwd=root)
+        else:
+            commands[args.command](args, gh, ticker, offset)
+    except GhError as error:
+        raise SystemExit(f"gh 실패: {error}")
+    finally:
+        if args.command not in ("hook", "show"):
+            try:
+                cache_path(root).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+if __name__ == "__main__":
+    main()
