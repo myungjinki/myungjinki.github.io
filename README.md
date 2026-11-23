@@ -68,8 +68,6 @@ npm run build
 | 라우터 | React Router |
 | 배포 | gh-pages |
 
-`docs/`는 지금 배포에 쓰지 않는 옛 정적 HTML 사이트다.
-
 ## 문서
 
 - [작업 지침](AGENTS.md): 에이전트가 따르는 검증·커밋 규칙과 함정
