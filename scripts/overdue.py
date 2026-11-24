@@ -27,12 +27,16 @@ def next_due(last, period):
     return last + timedelta(days=days) if days else None
 
 
+def cells_of(line):
+    return [cell.strip() for cell in re.split(r"(?<!\\)\|", line.strip().strip("|"))]
+
+
 def table_rows(section):
     """Yield the cells of each data row in a Markdown table section."""
     for line in section.splitlines():
         if not line.strip().startswith("|"):
             continue
-        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        cells = cells_of(line)
         if cells[0] in ("할 일", "번호", "") or set(cells[0]) <= {"-"}:
             continue
         yield cells
@@ -69,8 +73,12 @@ def due_items(text, today):
 def passed_waits(text, now):
     """Return (number, turn) pairs for 일회성 rows whose `대기:` date has passed."""
     items = []
-    for cells in table_rows(section_of(text, "일회성")):
-        number, turn = cells[0], cells[-1]
+    section = section_of(text, "일회성")
+    # 차례 뒤에 목표 열이 올 수 있어 열 이름으로 찾는다. 이름이 없는 표는 끝 칸이다.
+    header = next((cells_of(line) for line in section.splitlines() if line.strip().startswith("|")), [])
+    column = header.index("차례") if "차례" in header else -1
+    for cells in table_rows(section):
+        number, turn = cells[0], cells[column if column < len(cells) else -1]
         if not turn.startswith("대기:"):
             continue
         for day, clock in WAIT_DATE.findall(turn):
