@@ -5,7 +5,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        제목에는 짧은 제목만 적는다. 다음 `sync`가 제목 앞에 번호를 붙이고, 아래 칸을 본문 `순서:`·`대기:` 줄과 `구분:`·`등급:`·`차례:` 라벨로 바꾼다. 그 전까지는 `차례:사용자` 라벨이라 AI가 잡지 않는다.
+        제목에는 짧은 제목만 적는다. 다음 `sync`가 제목 앞에 번호를 붙이고, 아래 칸을 본문 `순서:`·`대기:` 줄과 `구분:`·`등급:`·`차례:`·`목표:` 라벨로 바꾼다. 그 전까지는 `차례:사용자` 라벨이라 AI가 잡지 않는다.
   - type: textarea
     id: text
     attributes:
@@ -52,3 +52,20 @@ body:
     attributes:
       label: 순서
       description: 작을수록 먼저. 비우면 순서 없이 표 끝에 놓인다.
+  - type: dropdown
+    id: goal
+    attributes:
+      label: 목표
+      description: "회사 목표의 번호. G0과 G1은 혼자만 고르고 G2–G8은 여럿 고를 수 있다. 부모 이슈의 목표를 물려받거나 모르면 비워 둔다."
+      multiple: true
+      options:
+        - 미정
+        - G0
+        - G1
+        - G2
+        - G3
+        - G4
+        - G5
+        - G6
+        - G7
+        - G8
