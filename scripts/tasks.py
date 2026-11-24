@@ -39,14 +39,14 @@ from pathlib import Path
 
 SCRIPTS = Path(__file__).resolve().parent
 # Increase when a changed tasks.py should replace older repository copies.
-TASKS_SCRIPT_VERSION = 1
+TASKS_SCRIPT_VERSION = 3
 KST = timezone(timedelta(hours=9))
 ACTIVE = "진행중"
 FAILED = "막을 것"
 TURNS = ("AI", "사용자", "대기")
 GRADES = ("최상", "상", "중", "하", "-")
 FIELDS = "number,title,body,labels,comments,state,closedAt,url"
-BRIEF = "number,title,labels,state,closedAt"
+BRIEF = "number,title,labels,state,closedAt,url"
 TASK_LABELS = ("구분", "등급", "차례")
 REOPENED = "다시 엶"
 META = re.compile(r"^(순서|대기):\s*(.*)$")
@@ -285,6 +285,7 @@ def item_of(issue, ticker, offset):
     order = meta.get("순서", "")
     return {
         "number": issue["number"],
+        "issue_link": issue_link(issue),
         "id": tid or f"{ticker}-{issue['number'] + offset}",
         "named": bool(tid),
         "title": title,
@@ -316,9 +317,16 @@ def cell(text):
     return " ".join((text or "").split()).replace("|", "\\|")
 
 
-def tasks_table(items):
-    rows = ["| 번호 | 구분 | 할 일 | 등급 | 차례 |", "|---|---|---|---|---|"]
-    rows += [f"| {i['id']} | {cell(i['kind'])} | {cell(i['text'])} | {i['grade']} | {cell(i['turn'])} |"
+def issue_link(issue):
+    url = issue.get("url")
+    return f"[#{issue['number']}]({url})" if url else "-"
+
+
+def tasks_table(items, *, with_issues=False):
+    rows = ["| 번호 | 구분 | 할 일 | 등급 |" + (" 이슈 |" if with_issues else "") + " 차례 |",
+            "|---|---|---|---|" + ("---|" if with_issues else "") + "---|"]
+    rows += [f"| {i['id']} | {cell(i['kind'])} | {cell(i['text'])} | {i['grade']} |"
+             + (f" {i['issue_link']} |" if with_issues else "") + f" {cell(i['turn'])} |"
              for i in sort_items(items)]
     return "\n".join(rows)
 
@@ -331,11 +339,27 @@ def summary_table(items):
     return "\n".join(rows)
 
 
-def active_table(items):
-    rows = ["| 번호 | 하는 일 | 멈춘 곳 | 다음 걸음 |", "|---|---|---|---|"]
+def active_table(items, *, with_issues=False):
+    rows = ["| 번호 | 하는 일 | 멈춘 곳 | 다음 걸음 |" + (" 이슈 |" if with_issues else ""),
+            "|---|---|---|---|" + ("---|" if with_issues else "")]
     rows += [f"| {i['id']} | {cell(i['title'])} | {cell(i['stopped'])} | {cell(i['next'])} |"
+             + (f" {i['issue_link']} |" if with_issues else "")
              for i in sort_items(items) if i["active"]]
     return "\n".join(rows)
+
+
+def utf16_width(text):
+    return len(text.encode("utf-16-le")) // 2
+
+
+def align_table(table):
+    """Pad a table's cells like jk-wiki's fmt_tables.py (UTF-16 width, min 3), so its pre-commit check passes."""
+    rows = [re.split(r"(?<!\\)\|", line.strip()[1:-1]) for line in table.split("\n")]
+    rows = [[c.strip() for c in row] for row in rows]
+    widths = [max([3] + [utf16_width(row[k]) for n, row in enumerate(rows) if n != 1]) for k in range(len(rows[0]))]
+    rows[1] = ["-" * w for w in widths]
+    return "\n".join("| " + " | ".join(c + " " * (widths[k] - utf16_width(c)) for k, c in enumerate(row)) + " |"
+                     for row in rows)
 
 
 def block_pattern(name):
@@ -391,14 +415,40 @@ def landed_entry(issue, ticker, offset):
     return item["id"], kst_day(issue.get("closedAt")), change, model, now, warning
 
 
+def landed_header(lines):
+    for index, line in enumerate(lines[:-1]):
+        if re.match(r"^\|\s*번호\s*\|\s*날짜\s*\|", line) and set(lines[index + 1].replace("|", "").strip()) <= {"-", " "}:
+            return index
+    raise ValueError("LANDED 표를 찾지 못함")
+
+
+def add_landed_issue_links(text, links, fit):
+    lines = text.split("\n")
+    start = landed_header(lines)
+    header = lines[start].rstrip()
+    if not re.search(r"\|\s*이슈\s*\|$", header):
+        lines[start] = header + " 이슈 |"
+        lines[start + 1] = lines[start + 1].rstrip() + "---|"
+    end = start + 2
+    while lines[end:end + 1] and lines[end].startswith("|"):
+        row = lines[end].rstrip()
+        cells = re.split(r"(?<!\\)\|", row[1:-1])
+        tid = cells[0].strip()
+        link = links.get(tid)
+        if len(cells) == 4:
+            lines[end] = row + f" {link or '-'} |"
+        elif link:
+            lines[end] = row[:row.rfind('|', 0, len(row) - 1) + 1] + f" {link} |"
+        end += 1
+    return "\n".join(lines[:start] + fit("\n".join(lines[start:end])).split("\n") + lines[end:])
+
+
 def insert_landed(text, rows):
     """Insert rows (id, day, change, model) at the top of the LANDED table, keeping their order."""
     lines = text.split("\n")
-    for index, line in enumerate(lines[:-1]):
-        if re.match(r"^\|\s*번호\s*\|\s*날짜\s*\|", line) and set(lines[index + 1].replace("|", "").strip()) <= {"-", " "}:
-            lines[index + 2:index + 2] = [f"| {i} | {d} | {cell(c)} | {cell(m)} |" for i, d, c, m in rows]
-            return "\n".join(lines)
-    raise ValueError("LANDED 표를 찾지 못함")
+    index = landed_header(lines) + 2
+    lines[index:index] = [f"| {i} | {d} | {cell(c)} | {cell(m)} |" for i, d, c, m in rows]
+    return "\n".join(lines)
 
 
 def update_landed(text, rows):
@@ -1127,8 +1177,9 @@ def cmd_sync(args, gh, ticker, offset, cwd=None):
             print(f"진행중 라벨 지움: {item_of(issue, ticker, offset)['id']} (닫힌 이슈)")
     items = [item_of(issue, ticker, offset) for issue in open_issues]
     new = dict(texts)
-    new["TASKS.md"] = replace_block(texts["TASKS.md"], "일회성", tasks_table(items))
-    new["STATE.md"] = replace_block(texts["STATE.md"], "진행 중", active_table(items))
+    fit = align_table if (root / ".wiki" / "config.json").is_file() else str
+    new["TASKS.md"] = replace_block(texts["TASKS.md"], "일회성", fit(tasks_table(items, with_issues=True)))
+    new["STATE.md"] = replace_block(texts["STATE.md"], "진행 중", fit(active_table(items, with_issues=True)))
     reopened = {i["id"] for i, issue in ((item_of(o, ticker, offset), o) for o in open_issues)
                 if i["id"] in have and any(head_of(c)[0] == REOPENED for c in issue.get("comments") or [])}
     if reopened:
@@ -1142,6 +1193,8 @@ def cmd_sync(args, gh, ticker, offset, cwd=None):
         new["LANDED.md"] = update_landed(new["LANDED.md"], [e[:4] for e in healed])
     if fresh:
         new["LANDED.md"] = insert_landed(new["LANDED.md"], [e[:4] for e in fresh])
+    links = {ticker_of(issue["title"], ticker)[0]: issue_link(issue) for issue in closed if issue.get("url")}
+    new["LANDED.md"] = add_landed_issue_links(new["LANDED.md"], links, fit)
     changed = [name for name in paths if new[name] != texts[name]]
     for name in changed:
         write_text(paths[name], new[name])
