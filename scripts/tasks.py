@@ -9,7 +9,11 @@
 그 사이에 sync가 돌면 LANDED.md에 `(요약 없음, 이슈 #n)` 행이 들어가지만, 다음 sync가 댓글을 읽어 그 행을
 고치고 `--now`를 다시 보인다. sync는 주 폴더가 기본 브랜치에 있고 origin보다 뒤처지지 않았을 때만 쓴다.
 
-설정은 대상 저장소의 scripts/tasks.json({"ticker": "RAE", "offset": n})에 둔다. 새 번호는 이슈 번호 + offset이다.
+설정은 대상 저장소의 scripts/tasks.json에 둔다. ticker가 없으면 새 방식, 있으면 옛 방식이다.
+- 새 방식({"since": "YYYY-MM-DD"}, since는 생략 가능): 번호는 이슈 번호다. 저장소 안에서는 `#173`, 다른 저장소에서는 `저장소#173`으로
+  적고 이슈 제목에는 붙이지 않는다. 명령은 `173`·`"#173"`·`"저장소#173"`을 받고, 다른 저장소의 번호와 PR 번호는 거부한다.
+  sync는 KST로 since 당일부터 닫힌 이슈만 LANDED.md에 적는다(since가 없으면 모두).
+- 옛 방식({"ticker": "RAE", "offset": n}): 새 번호는 이슈 번호 + offset이고 sync가 제목 앞에 `RAE-n`을 붙인다.
 이슈 본문은 할 일 설명 뒤에 `순서: n`·`대기: 조건` 줄을 둔다. 라벨은 `구분:`·`등급:`·`차례:`·`목표:`, `진행중`, `막을 것`이다.
 목표는 `목표:G2` 라벨이고 부모는 GitHub 하위 이슈다. 자기 라벨이 없으면 부모를 8단계까지 따라 올라가 물려받는다.
 `G0`·`G1`은 혼자만 쓰고 라벨이 없는 것은 미정이다. 규칙은 사내 지침의 docs/01-goals.md를 따른다.
@@ -18,8 +22,8 @@
 세션 이름과 잡은 일을 저장해 같은 워크트리에서 무인자 `note`·`release`가 동작하게 한다. 24시간 이상 갱신 없는
 선점은 `hook`·`show`·`sync`와 `claim` 충돌 안내에서 경고한다.
 
-할 일 이슈는 제목이 `<티커>-n`으로 시작하거나 `구분:`·`등급:`·`차례:` 라벨이 하나라도 있는 이슈다. 그 밖의 이슈(버그 신고 등)는
-표·LANDED에 넣지 않고 제목도 바꾸지 않는다. 할 일로 삼으려면 `turn #이슈번호 AI`로 차례 라벨을 단다.
+할 일 이슈는 `구분:`·`등급:`·`차례:` 라벨이 하나라도 있는 이슈다(옛 방식은 제목이 `<티커>-n`으로 시작하는 이슈도). 그 밖의 이슈(버그 신고 등)는
+표·LANDED에 넣지 않고 제목도 바꾸지 않는다. 할 일로 삼으려면 `turn "#이슈번호" AI`로 차례 라벨을 단다.
 
 GitHub 웹·휴대폰에서 `.github/ISSUE_TEMPLATE/task.yml` 양식으로 만든 이슈는 `### 할 일` 같은 칸 제목으로 본문이 온다.
 `show`·`hook`은 그 칸을 읽어 보이고, `sync`는 본문을 `순서:`·`대기:` 줄 형식으로, 고른 칸을 `구분:`·`등급:`·`차례:`·`목표:` 라벨로 바꾼다.
@@ -41,7 +45,7 @@ from pathlib import Path
 
 SCRIPTS = Path(__file__).resolve().parent
 # Increase when a changed tasks.py should replace older repository copies.
-TASKS_SCRIPT_VERSION = 4
+TASKS_SCRIPT_VERSION = 6
 KST = timezone(timedelta(hours=9))
 ACTIVE = "진행중"
 FAILED = "막을 것"
@@ -55,6 +59,9 @@ SOLO_GOALS = ("G0", "G1")
 UNDECIDED = "미정"
 PARENT_LEVELS = 8
 PARENT_URL = re.compile(r"https://github\.com/([\w.-]+)/([\w.-]+)/issues/([1-9]\d*)")
+ISSUE_URL = re.compile(r"https://[^/]+/[\w.-]+/([\w.-]+)/(issues|pull)/[1-9]\d*")
+# 새 방식의 번호: 173, #173, 저장소#173
+REF = re.compile(r"(?:([\w.-]+)?#)?([1-9]\d*)")
 REOPENED = "다시 엶"
 META = re.compile(r"^(순서|대기):\s*(.*)$")
 NOTICE = "이 표는 GitHub Issues의 사본이다. 고치지 말고 scripts/tasks.py를 쓴다."
@@ -118,12 +125,76 @@ class GhError(Exception):
 # ---------- 순수 함수: 테스트 대상 ----------
 
 def load_config(path):
+    """Return (ticker, offset). Without a ticker the issue number is the task number: (None, 0)."""
     data = json.loads(Path(path).read_text(encoding="utf-8"))
+    if "ticker" not in data:
+        return None, 0
     return data["ticker"], int(data["offset"])
+
+
+def load_since(path):
+    """Return the first KST day whose closed issues go into LANDED.md, or None for all of them."""
+    try:
+        since = json.loads(Path(path).read_text(encoding="utf-8")).get("since")
+    except FileNotFoundError:
+        return None
+    return None if since is None else valid_day(since)
+
+
+def valid_day(text):
+    try:
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+            return date.fromisoformat(text).isoformat()
+    except (TypeError, ValueError):
+        pass
+    raise SystemExit(f"since는 YYYY-MM-DD 날짜다: {text}")
+
+
+def task_id(issue, ticker, offset):
+    """The id shown for an issue: `#n`, or the old `<ticker>-n`."""
+    if ticker is None:
+        return f"#{issue['number']}"
+    return ticker_of(issue.get("title"), ticker)[0] or f"{ticker}-{issue['number'] + offset}"
+
+
+def typed(tid):
+    """An id as it is typed in a shell, where a leading `#` would start a comment."""
+    return tid.lstrip("#")
+
+
+def parse_ref(ref):
+    """Split `173`, `#173` or `저장소#173` into (repository or None, number)."""
+    match = REF.fullmatch(ref.strip())
+    if not match:
+        raise SystemExit(f"{ref}: 이 저장소의 할 일 번호는 이슈 번호다. 173, \"#173\", \"저장소#173\" 가운데 하나로 준다")
+    return match.group(1), int(match.group(2))
+
+
+def number_here(ref, repository):
+    """The issue number in ref. repository() names this repository and is asked only when ref names one."""
+    repo, number = parse_ref(ref)
+    if repo:
+        here = repository()
+        if repo.lower() != here.lower():
+            raise SystemExit(f"{ref.strip()}은 이 저장소({here or '이름 확인 못 함'})의 할 일이 아니라 아무것도 하지 않았다")
+    return number
+
+
+def repo_of(issue):
+    """The repository name in an issue's URL, or of a GraphQL parent."""
+    match = ISSUE_URL.match(issue.get("url") or "")
+    return match.group(1) if match else (issue.get("repository") or {}).get("nameWithOwner", "").rsplit("/", 1)[-1]
+
+
+def is_pull(issue):
+    match = ISSUE_URL.match(issue.get("url") or "")
+    return bool(match) and match.group(2) == "pull"
 
 
 def ticker_of(title, ticker):
     """Split an issue title into (ticker id or None, rest)."""
+    if ticker is None:
+        return None, (title or "").strip()
     match = re.match(rf"^({re.escape(ticker)}-\d+)\b\s*(.*)$", (title or "").strip())
     return (match.group(1), match.group(2).strip()) if match else (None, (title or "").strip())
 
@@ -242,23 +313,26 @@ def goal_known(issue):
     return "parent" in issue or bool(own_goals(issue))
 
 
-def reference(issue):
-    """A link to an issue named by its ticker id, or by repository and number."""
+def reference(issue, numbered=False):
+    """A link to an issue named `저장소#n`; in old-style repositories by its ticker id, or by repository and number."""
     match = re.match(r"[A-Z]+-\d+\b", issue.get("title") or "")
-    name = match.group(0) if match else f"{(issue.get('repository') or {}).get('nameWithOwner', '')}#{issue['number']}"
+    if numbered:
+        name = f"{repo_of(issue)}#{issue['number']}"
+    else:
+        name = match.group(0) if match else f"{(issue.get('repository') or {}).get('nameWithOwner', '')}#{issue['number']}"
     return f"[{name}]({issue['url']})" if issue.get("url") else name
 
 
-def goal_path(issue):
-    """The way from the goal to this issue, e.g. `G2 ← [CEO-1](…) ← [RAE-5](…)`."""
+def goal_path(issue, numbered=False):
+    """The way from the goal to this issue, e.g. `G2 ← [chief#1](…) ← [role#5](…)`."""
     if not goal_known(issue):
         return "확인 못 함 (부모를 읽지 못함)"
     goals, chain = goals_of(issue)
-    path = " ← ".join(["·".join(goals) or UNDECIDED] + [reference(node) for node in reversed(chain)])
+    path = " ← ".join(["·".join(goals) or UNDECIDED] + [reference(node, numbered) for node in reversed(chain)])
     parent = chain[-1].get("parent")
     if parent:
         hidden = parent.get("hidden")
-        path += " (읽을 수 없는 부모가 있음)" if hidden else f" (부모: {reference(parent)})" if len(chain) == 1 else ""
+        path += " (읽을 수 없는 부모가 있음)" if hidden else f" (부모: {reference(parent, numbered)})" if len(chain) == 1 else ""
     return path
 
 
@@ -282,7 +356,7 @@ def readable_part(text):
 
 
 def is_task(issue, ticker):
-    """True for issues tasks.py manages: a ticker title or any 구분·등급·차례 label."""
+    """True for issues tasks.py manages: any 구분·등급·차례 label, or a ticker title in old-style repositories."""
     if ticker_of(issue.get("title"), ticker)[0]:
         return True
     return any(name.split(":", 1)[0] in TASK_LABELS for name in label_names(issue) if ":" in name)
@@ -389,7 +463,7 @@ def stale_claim_lines(items, now=None, hours=STALE_HOURS):
         where = f", 브랜치 {item['branch']}" if item.get("branch") else ""
         lines.append(
             f"- {item['id']} ({item['holder']}, {int(age)}시간 전{where}) — "
-            f"멈춘 세션이면 `tasks.py release {item['id']} --force`로 놓는다"
+            f"멈춘 세션이면 `tasks.py release {typed(item['id'])} --force`로 놓는다"
         )
     return lines
 
@@ -410,13 +484,13 @@ def failure_lines(issues, ticker, offset):
     """Lines for failures not yet blocked, oldest issue first."""
     lines = []
     for issue in sorted(issues or [], key=lambda i: i["number"]):
-        tid = ticker_of(issue.get("title"), ticker)[0] or f"{ticker}-{issue['number'] + offset}"
+        tid = task_id(issue, ticker, offset)
         lines += [f"- {tid}: {cell(what)} ({who})" for who, what in open_failures(issue.get("comments"))]
     return lines
 
 
 def item_of(issue, ticker, offset):
-    tid, title = ticker_of(issue.get("title"), ticker)
+    title = ticker_of(issue.get("title"), ticker)[1]
     names = label_names(issue)
     form = parse_form(issue.get("body"))
     text, meta = (form.get("text", ""), form) if form is not None else parse_body(issue.get("body"))
@@ -430,8 +504,7 @@ def item_of(issue, ticker, offset):
     return {
         "number": issue["number"],
         "issue_link": issue_link(issue),
-        "id": tid or f"{ticker}-{issue['number'] + offset}",
-        "named": bool(tid),
+        "id": task_id(issue, ticker, offset),
         "title": title,
         "text": text or title,
         "kind": label_value(names, "구분") or "-",
@@ -452,7 +525,7 @@ def item_of(issue, ticker, offset):
 
 
 def id_number(tid):
-    return int(tid.rsplit("-", 1)[1])
+    return int(re.search(r"\d+$", tid).group())
 
 
 def sort_items(items):
@@ -524,8 +597,12 @@ def replace_block(text, name, table):
     return block_pattern(name).sub(lambda m: f"{m.group(1)}\n\n{table}\n\n{m.group(3)}", text, count=1)
 
 
+def id_pattern(ticker):
+    return r"#\d+" if ticker is None else rf"{re.escape(ticker)}-\d+"
+
+
 def landed_ids(text, ticker):
-    return set(re.findall(rf"^\|\s*({re.escape(ticker)}-\d+)\s*\|", text, re.M))
+    return set(re.findall(rf"^\|\s*({id_pattern(ticker)})\s*\|", text, re.M))
 
 
 PLACEHOLDER = re.compile(r"\(요약 없음, 이슈 #\d+\)")
@@ -533,7 +610,7 @@ PLACEHOLDER = re.compile(r"\(요약 없음, 이슈 #\d+\)")
 
 def placeholder_ids(text, ticker):
     """Ids of LANDED rows written before the closing comment arrived."""
-    return {m.group(1) for m in re.finditer(rf"^\|\s*({re.escape(ticker)}-\d+)\s*\|(.*)$", text, re.M)
+    return {m.group(1) for m in re.finditer(rf"^\|\s*({id_pattern(ticker)})\s*\|(.*)$", text, re.M)
             if PLACEHOLDER.search(m.group(2))}
 
 
@@ -705,9 +782,12 @@ def resolve_ref(args_ref, cwd=None):
     return ref
 
 
-def session_issue(session, ref):
+def session_issue(session, ref, ticker):
     tid, number = session.get("ref"), session.get("issue_number")
     if isinstance(tid, str) and type(number) is int and number > 0:
+        if ticker is None:
+            # 옛 방식일 때 저장한 `<티커>-n`은 이슈 번호와 다르므로 쓰지 않는다.
+            return number if tid == f"#{number}" and ref.strip() in (tid, str(number)) else None
         if ref.strip() in (tid, tid.rsplit("-", 1)[-1], f"#{number}"):
             return number
     return None
@@ -795,6 +875,10 @@ class GH:
     def brief(self, state):
         """Issues without bodies and comments."""
         return self.list(state, BRIEF)
+
+    def repository(self):
+        """The name of the repository the issue commands write to."""
+        return json.loads(self.run("repo", "view", "--json", "name"))["name"]
 
     def issue(self, number):
         return json.loads(self.run("issue", "view", str(number), "--json", FIELDS))
@@ -1018,7 +1102,8 @@ def print_stale_claims(items, now=None, hours=STALE_HOURS):
 def print_unlinked(items):
     lines = [f"- {i['id']} {i['title']}" for i in sort_items(items) if i["unlinked"]]
     if lines:
-        print("\n목표도 부모도 없는 열린 이슈 (`tasks.py edit <번호> --goal <G번호>`나 `--parent <티커-n|이슈 URL>`로 잇는다):")
+        own = "이슈 번호" if lines[0].startswith("- #") else "티커-n"
+        print(f"\n목표도 부모도 없는 열린 이슈 (`tasks.py edit <번호> --goal <G번호>`나 `--parent <{own}|이슈 URL>`로 잇는다):")
         print("\n".join(lines))
 
 
@@ -1028,8 +1113,16 @@ def write_text(path, text):
 
 
 def resolve(gh, ref, ticker, offset, read=None):
-    """Return the issue for `<ticker>-n`, `n` (ticker number) or `#n` (issue number). read gets one issue (gh.issue)."""
+    """Return the issue for `n`, `#n` or `저장소#n`. read gets one issue (gh.issue).
+
+    With a ticker: `<ticker>-n`, `n` (ticker number) or `#n` (issue number).
+    """
     ref, read = ref.strip(), read or gh.issue
+    if ticker is None:
+        issue = read(number_here(ref, gh.repository))
+        if is_pull(issue):  # gh issue view는 PR 번호에도 답한다
+            raise SystemExit(f"#{issue['number']}은 이슈가 아니라 PR이라 아무것도 하지 않았다")
+        return issue
     if ref.startswith("#"):
         return read(int(ref[1:]))
     number = id_number(ref) if "-" in ref else int(ref)
@@ -1060,16 +1153,17 @@ def load_overdue():
 def detail_lines(issue, ticker, offset, now=None):
     """Lines describing one issue: the full task text, turn, holder, note and unblocked failures."""
     item = item_of(issue, ticker, offset)
-    lines = [f"## {item['id']} (#{issue['number']}, {issue.get('state', '')}) {item['title']}", "", item["text"], "",
+    number = "" if ticker is None else f"#{issue['number']}, "
+    lines = [f"## {item['id']} ({number}{issue.get('state', '')}) {item['title']}", "", item["text"], "",
              f"- 구분: {item['kind']} · 등급: {item['grade']} · 차례: {item['turn']}",
-             f"- 목표: {goal_path(issue)}",
+             f"- 목표: {goal_path(issue, numbered=ticker is None)}",
              f"- 잡은 세션: {item['holder'] or '-'} · 멈춘 곳: {item['stopped']} · 다음 걸음: {item['next']}"]
     loc = [f"{k}: {item[f]}" for k, f in (("브랜치", "branch"), ("워크트리", "worktree"), ("시각", "claimed_at")) if item.get(f)]
     if loc:
         lines.append("- 선점 정보: " + " · ".join(loc))
     age = claim_age_hours(item, now=now)
     if age is not None and age >= STALE_HOURS:
-        lines.append(f"- 오래된 선점: {int(age)}시간 전 — 멈춘 세션이면 `tasks.py release {item['id']} --force`로 놓는다")
+        lines.append(f"- 오래된 선점: {int(age)}시간 전 — 멈춘 세션이면 `tasks.py release {typed(item['id'])} --force`로 놓는다")
     lines += [f"- 막지 않은 실패: {what} ({who})" for who, what in open_failures(issue.get("comments"))]
     return lines
 
@@ -1079,7 +1173,13 @@ def cmd_show(args, gh, ticker, offset, cwd=None):
         cached = read_cache(cache_path(cwd))
         if cached and (args.offline or 0 <= cached[2] < CACHE_TTL_SECONDS):
             ref = args.ref.strip()
-            number = int(ref[1:] if ref.startswith("#") else ref.rsplit("-", 1)[-1])
+            if ticker is None:
+                saved = cached[0] + cached[1]
+                number = number_here(ref, gh.repository if gh and not args.offline else
+                                     lambda: next(map(repo_of, saved), ""))
+                ref = f"#{number}"
+            else:
+                number = int(ref[1:] if ref.startswith("#") else ref.rsplit("-", 1)[-1])
             for issue in cached[0] + cached[1]:
                 tid = item_of(issue, ticker, offset)["id"]
                 if (ref.startswith("#") and issue["number"] == number) or (
@@ -1169,11 +1269,11 @@ def goals_arg(args):
 
 
 def parent_node(gh, ref, ticker, offset):
-    """Return the GitHub node of `<ticker>-n` in this repository or of an issue URL in any repository."""
+    """Return the GitHub node of a task number in this repository or of an issue URL in any repository."""
     url = PARENT_URL.fullmatch(ref)
     if url:
         return gh.node(int(url.group(3)), url.group(1), url.group(2))
-    if ref.rsplit("-", 1)[0] != ticker:
+    if ticker is not None and ref.rsplit("-", 1)[0] != ticker:
         raise SystemExit(f"{ref}은 이 저장소({ticker})의 할 일이 아니다. 다른 저장소의 부모는 이슈 URL로 준다")
     return gh.node(resolve(gh, ref, ticker, offset)["number"])
 
@@ -1181,6 +1281,8 @@ def parent_node(gh, ref, ticker, offset):
 def cmd_add(args, gh, ticker, offset):
     if args.turn == "대기" and not args.wait:
         raise SystemExit("차례가 대기면 --wait에 조건을 적는다")
+    if args.id and ticker is None:
+        raise SystemExit("이 저장소의 번호는 이슈 번호라 --id를 쓰지 않는다")
     ref = getattr(args, "parent", None)
     parent = parent_node(gh, ref, ticker, offset) if ref else None
     order = args.order
@@ -1195,16 +1297,16 @@ def cmd_add(args, gh, ticker, offset):
     url = with_labels(gh, labels, lambda: gh.run("issue", "create", "--title", title, "--body-file", "-",
                                                  "--label", ",".join(labels), stdin=body)).strip()
     number = int(url.rstrip("/").rsplit("/", 1)[1])
-    tid = args.id or f"{ticker}-{number + offset}"
-    if not args.id:
+    tid = args.id or task_id({"number": number}, ticker, offset)
+    if not args.id and ticker is not None:
         gh.edit(number, "--title", f"{tid} {args.title}")
-    print(f"{tid} (#{number}) {url}")
+    print(f"{tid} {url}" if ticker is None else f"{tid} (#{number}) {url}")
     if parent:
         try:
             gh.add_parent(parent["id"], url)
         except GhError as error:
             raise SystemExit(f"{tid} 이슈는 만들었지만 부모를 걸지 못했다({error}). "
-                             f"다시 만들지 말고 `tasks.py edit {tid} --parent {ref}`로 건다")
+                             f"다시 만들지 말고 `tasks.py edit {typed(tid)} --parent {typed(ref)}`로 건다")
 
 
 def cmd_edit(args, gh, ticker, offset):
@@ -1256,7 +1358,9 @@ def cmd_claim(args, gh, ticker, offset, cwd=None):
         raise SystemExit(f"{tid}은 닫혀 있다")
     session = load_session(cwd)
     root = toplevel(cwd)
-    who = args.who or session.get("who") or f"{root.name}-{secrets.token_hex(2)}"
+    # 저장된 이름은 저장된 ref가 이번에 잡는 할 일과 같을 때만 쓴다. release·close 뒤에 남은 이름을 다른 일에 쓰지 않는다.
+    saved = session.get("who") if session.get("ref") == tid else None
+    who = args.who or saved or f"{root.name}-{secrets.token_hex(2)}"
     info = claim_info(issue["comments"])
     holder = info["holder"]
     if holder == who:
@@ -1266,7 +1370,7 @@ def cmd_claim(args, gh, ticker, offset, cwd=None):
     if holder:
         extra = f" (브랜치: {info['branch']})" if info["branch"] else ""
         age = claim_age_hours(info)
-        hint = (f". {int(age)}시간 전 선점이라 멈춘 세션이면 `tasks.py release {tid} --force` 뒤 다시 잡는다"
+        hint = (f". {int(age)}시간 전 선점이라 멈춘 세션이면 `tasks.py release {typed(tid)} --force` 뒤 다시 잡는다"
                 if age is not None and age >= STALE_HOURS else "")
         raise SystemExit(f"{tid}은 {holder}{extra}가 잡고 있어 하지 않는다{hint}")
     started = time.monotonic()
@@ -1281,13 +1385,13 @@ def cmd_claim(args, gh, ticker, offset, cwd=None):
         save_session(session.get("who") or who, ref=session.get("ref"), cwd=cwd,
                      issue_number=session.get("issue_number"))
         raise SystemExit(f"{holder}가 먼저 잡았다. {tid}은 하지 않는다")
-    print(f"{tid} (#{issue['number']})을 잡았다. 이름: {who}")
+    print(f"{tid}을 잡았다. 이름: {who}" if ticker is None else f"{tid} (#{issue['number']})을 잡았다. 이름: {who}")
 
 
 def cmd_note(args, gh, ticker, offset, cwd=None):
     ref = resolve_ref(args.ref, cwd=cwd)
     session = load_session(cwd)
-    number = session_issue(session, ref)
+    number = session_issue(session, ref, ticker)
     tid = session.get("ref")
     who = args.who or session.get("who")
     if number is None or not who:
@@ -1351,12 +1455,12 @@ def require_effect(issue, tid, effect):
     goals = needs_effect(issue)
     if goals and not effect:
         raise SystemExit(f"{tid}은 목표 {'·'.join(goals)} 라벨이 있어 전후 없이 닫지 않는다. `--effect \"<전 → 후>\"`를 주거나, "
-                         f"전후를 적을 수 없으면 `tasks.py edit {tid} --goal G0`으로 바꾼 뒤 닫는다")
+                         f"전후를 적을 수 없으면 `tasks.py edit {typed(tid)} --goal G0`으로 바꾼 뒤 닫는다")
 
 
 def close_command(args, gh, ticker, offset, cwd=None):
     """close from the command line: the claimed-issue shortcut of cmd_close does not read labels, so read them here."""
-    number = session_issue(load_session(cwd), args.ref)
+    number = session_issue(load_session(cwd), args.ref, ticker)
     if number is not None and not effect_arg(args):
         issue = gh.issue(number)
         require_effect(issue, item_of(issue, ticker, offset)["id"], "")
@@ -1366,7 +1470,7 @@ def close_command(args, gh, ticker, offset, cwd=None):
 def cmd_close(args, gh, ticker, offset, cwd=None):
     effect = effect_arg(args)
     session = load_session(cwd)
-    number = session_issue(session, args.ref)
+    number = session_issue(session, args.ref, ticker)
     if number is None:
         issue = resolve(gh, args.ref, ticker, offset)
         number = issue["number"]
@@ -1446,14 +1550,18 @@ def cmd_sync(args, gh, ticker, offset, cwd=None):
     paths = {name: root / name for name in ("TASKS.md", "STATE.md", "LANDED.md")}
     texts = {name: path.read_text(encoding="utf-8") for name, path in paths.items()}
     have, waiting = landed_ids(texts["LANDED.md"], ticker), placeholder_ids(texts["LANDED.md"], ticker)
+    since = load_since(root / "scripts" / "tasks.json") if ticker is None else None
+
+    def to_land(issue):
+        """True for a closed task whose LANDED row is missing or still waits for its closing comment."""
+        tid = task_id(issue, ticker, offset)
+        return tid in waiting or (tid not in have and (since is None or kst_day(issue.get("closedAt")) >= since))
+
     every = gh.brief("all")
     numbers = []
     for issue in every:
         number = issue["number"]
-        tid = ticker_of(issue["title"], ticker)[0] or f"{ticker}-{number + offset}"
-        if FAILED in label_names(issue) or (
-            is_task(issue, ticker) and (issue["state"] == "OPEN" or tid not in have or tid in waiting)
-        ):
+        if FAILED in label_names(issue) or (is_task(issue, ticker) and (issue["state"] == "OPEN" or to_land(issue))):
             numbers.append(number)
     details = gh.issue_details(numbers)
     every = [details.get(issue["number"], issue) for issue in every]
@@ -1470,7 +1578,7 @@ def cmd_sync(args, gh, ticker, offset, cwd=None):
     skipped = len(every) - len(open_issues) - len(closed)
     for issue in open_issues + closed:
         tid, title = ticker_of(issue["title"], ticker)
-        if not tid:
+        if ticker is not None and not tid:
             tid = f"{ticker}-{issue['number'] + offset}"
             gh.edit(issue["number"], "--title", f"{tid} {title}")
             issue["title"] = f"{tid} {title}"
@@ -1506,7 +1614,7 @@ def cmd_sync(args, gh, ticker, offset, cwd=None):
     if reopened:
         new["LANDED.md"] = drop_landed(new["LANDED.md"], reopened)
         have -= reopened
-    full = [i for i in closed if item_of(i, ticker, offset)["id"] not in have or item_of(i, ticker, offset)["id"] in waiting]
+    full = [issue for issue in closed if to_land(issue)]
     entries = [landed_entry(issue, ticker, offset) for issue in sorted(full, key=lambda i: i.get("closedAt") or "", reverse=True)]
     fresh = [e for e in entries if e[0] not in have]
     healed = [e for e in entries if e[0] in waiting and not e[5]]
@@ -1516,7 +1624,7 @@ def cmd_sync(args, gh, ticker, offset, cwd=None):
         new["LANDED.md"] = update_landed(new["LANDED.md"], [(*e[:4], goals[e[0]]) for e in healed])
     if fresh:
         new["LANDED.md"] = insert_landed(new["LANDED.md"], [(*e[:4], goals[e[0]]) for e in fresh])
-    links = {ticker_of(issue["title"], ticker)[0]: issue_link(issue) for issue in closed if issue.get("url")}
+    links = {task_id(issue, ticker, offset): issue_link(issue) for issue in closed if issue.get("url")}
     new["LANDED.md"] = add_landed_issue_links(new["LANDED.md"], links, fit)
     changed = [name for name in paths if new[name] != texts[name]]
     for name in changed:
@@ -1525,8 +1633,9 @@ def cmd_sync(args, gh, ticker, offset, cwd=None):
     for tid in sorted(reopened, key=id_number):
         print(f"LANDED에서 뺌: {tid} (다시 열림)")
     if skipped:
-        print(f"할 일이 아닌 이슈 {skipped}개는 건너뛰었다(번호 제목도 구분·등급·차례 라벨도 없음). "
-              "할 일로 삼으려면 `tasks.py turn #이슈번호 AI`")
+        titled = "" if ticker is None else "번호 제목도 "
+        print(f"할 일이 아닌 이슈 {skipped}개는 건너뛰었다({titled}구분·등급·차례 라벨{'도' if titled else '이'} 없음). "
+              f"할 일로 삼으려면 `tasks.py turn {'이슈번호' if ticker is None else '#이슈번호'} AI`")
     for tid, _, _, _, now, _ in fresh + healed:
         if tid in waiting:
             print(f"요약 채움: {tid} (닫는 댓글이 뒤에 왔다)")
@@ -1534,7 +1643,7 @@ def cmd_sync(args, gh, ticker, offset, cwd=None):
             print(f"STATE '지금'에 반영할 것 ({tid}): {now}")
     for tid, *_ in [e for e in entries if e[5] and (e[0] not in have or e[0] in waiting)]:
         print(f"확인: {tid}은 닫는 댓글(끝·취소)이 없어 LANDED에 제목으로 적었다. "
-              f"`tasks.py close {tid} --model ... --summary ...`(또는 cancel)로 남기면 다음 sync가 그 행을 고친다")
+              f"`tasks.py close {typed(tid)} --model ... --summary ...`(또는 cancel)로 남기면 다음 sync가 그 행을 고친다")
     print_stale_claims(items)
     print_unlinked(items)
     print_failures(failed, ticker, offset)
@@ -1548,8 +1657,9 @@ def goal_option(text):
 
 
 def parent_option(text):
-    if not re.fullmatch(r"[A-Z]+-[1-9]\d*", text) and not PARENT_URL.fullmatch(text):
-        raise argparse.ArgumentTypeError(f"부모는 <티커>-n이나 https://github.com/<소유자>/<저장소>/issues/<n>으로 준다: {text}")
+    # 옛 방식의 저장소에서 쓸 수 없는 번호는 parent_node가 거른다.
+    if not re.fullmatch(r"[A-Z]+-[1-9]\d*", text) and not REF.fullmatch(text) and not PARENT_URL.fullmatch(text):
+        raise argparse.ArgumentTypeError(f"부모는 이슈 번호(옛 방식은 <티커>-n)나 https://github.com/<소유자>/<저장소>/issues/<n>으로 준다: {text}")
     return text
 
 
@@ -1565,7 +1675,7 @@ def parser():
     top = TasksParser(description=__doc__.split("\n")[0])
     sub = top.add_subparsers(dest="command", required=True)
     show = sub.add_parser("show", help="이슈의 할 일과 진행 중을 표로 보인다. 번호를 주면 그 일 하나를 자세히 보인다")
-    show.add_argument("ref", nargs="?", help="<티커>-n, n 또는 #이슈번호")
+    show.add_argument("ref", nargs="?", help='173, "#173" 또는 "저장소#173" (옛 방식: <티커>-n, n 또는 "#이슈번호")')
     show.add_argument("--offline", action="store_true")
     hook = sub.add_parser("hook", help="세션 시작 출력")
     hook.add_argument("--offline", action="store_true")
@@ -1578,8 +1688,8 @@ def parser():
     add.add_argument("--turn", default="AI", choices=TURNS)
     add.add_argument("--wait", help="차례가 대기일 때의 조건")
     add.add_argument("--order", type=int, help="작을수록 먼저. 없으면 맨 뒤")
-    add.add_argument("--id", help="옮겨 오는 항목의 기존 번호 (예: RAE-66)")
-    add.add_argument("--parent", type=parent_option, help="부모 할 일: <티커>-n, 다른 저장소는 이슈 URL. 목표를 물려받는다")
+    add.add_argument("--id", help="옛 방식에서 옮겨 오는 항목의 기존 번호 (예: RAE-66)")
+    add.add_argument("--parent", type=parent_option, help="부모 할 일: 이슈 번호(옛 방식은 <티커>-n), 다른 저장소는 이슈 URL. 목표를 물려받는다")
     add.add_argument("--goal", type=goal_option, help="G0–G8(G2–G8은 쉼표로 여럿)이나 미정. --parent와 함께 주면 하위의 덮어쓰기")
     edit = sub.add_parser("edit", help="제목·할 일·구분·순서·목표·부모를 고친다")
     edit.add_argument("ref")
@@ -1589,7 +1699,7 @@ def parser():
     edit.add_argument("--order", type=int, help="새 순서. 작을수록 먼저")
     edit.add_argument("--goal", type=goal_option, help="새 목표. 미정이면 목표 라벨을 뗀다")
     family = edit.add_mutually_exclusive_group()
-    family.add_argument("--parent", type=parent_option, help="새 부모: <티커>-n, 다른 저장소는 이슈 URL")
+    family.add_argument("--parent", type=parent_option, help="새 부모: 이슈 번호(옛 방식은 <티커>-n), 다른 저장소는 이슈 URL")
     family.add_argument("--no-parent", action="store_true", help="부모를 뗀다")
     claim = sub.add_parser("claim", help="일을 잡는다. 먼저 잡은 세션이 한다")
     claim.add_argument("ref")

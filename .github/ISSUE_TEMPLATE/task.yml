@@ -1,11 +1,11 @@
 name: 할 일
-description: 일회성 할 일 하나를 올린다. 번호는 주 폴더의 `scripts/tasks.py sync`가 붙인다.
+description: 일회성 할 일 하나를 올린다. 번호는 이슈 번호다(티커를 쓰는 저장소는 주 폴더의 `scripts/tasks.py sync`가 붙인다).
 labels: ["차례:사용자"]
 body:
   - type: markdown
     attributes:
       value: |
-        제목에는 짧은 제목만 적는다. 다음 `sync`가 제목 앞에 번호를 붙이고, 아래 칸을 본문 `순서:`·`대기:` 줄과 `구분:`·`등급:`·`차례:`·`목표:` 라벨로 바꾼다. 그 전까지는 `차례:사용자` 라벨이라 AI가 잡지 않는다.
+        제목에는 짧은 제목만 적는다. 다음 `sync`가 아래 칸을 본문 `순서:`·`대기:` 줄과 `구분:`·`등급:`·`차례:`·`목표:` 라벨로 바꾼다. 그 전까지는 `차례:사용자` 라벨이라 AI가 잡지 않는다.
   - type: textarea
     id: text
     attributes:
