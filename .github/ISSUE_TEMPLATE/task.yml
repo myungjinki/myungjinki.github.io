@@ -1,5 +1,5 @@
 name: 할 일
-description: 일회성 할 일 하나를 올린다. 번호는 이슈 번호다(티커를 쓰는 저장소는 주 폴더의 `scripts/tasks.py sync`가 붙인다).
+description: 일회성 할 일 하나를 올린다. 번호는 이슈 번호다.
 labels: ["차례:사용자"]
 body:
   - type: markdown
