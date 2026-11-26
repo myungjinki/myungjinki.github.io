@@ -5,12 +5,26 @@ body:
   - type: markdown
     attributes:
       value: |
-        제목에는 짧은 제목만 적는다. 다음 `sync`가 아래 칸을 본문 `순서:`·`대기:` 줄과 `구분:`·`등급:`·`차례:`·`목표:` 라벨로 바꾼다. 그 전까지는 `차례:사용자` 라벨이라 AI가 잡지 않는다.
+        제목에는 짧은 제목만 적는다. 다음 `sync`가 아래 칸을 `tasks.py add`가 만드는 본문(`### 이유`·`### 끝 조건`·`### 단계`와 `순서:`·`대기:` 줄)과 `구분:`·`등급:`·`차례:`·`목표:` 라벨로 바꾼다. 그 전까지는 `차례:사용자` 라벨이라 AI가 잡지 않는다.
   - type: textarea
-    id: text
+    id: why
     attributes:
-      label: 할 일
-      description: 무엇이 되면 끝인지까지 적는다.
+      label: 이유
+      description: 왜 하는지. 잰 값이 있으면 잰 날짜와 함께 적는다.
+    validations:
+      required: true
+  - type: textarea
+    id: done
+    attributes:
+      label: 끝 조건
+      description: 무엇이 되면 끝인지. 한 줄에 하나씩 적으면 sync가 줄마다 체크박스(`- [ ] `)로 바꾼다.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 단계
+      description: "한 줄에 단계 하나를 `<단계> · <맡는 등급>`으로 적는다. sync가 체크박스와 번호를 붙이고, 등급을 빼면 아래 등급을 붙인다."
     validations:
       required: true
   - type: input
