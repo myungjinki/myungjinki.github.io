@@ -2,7 +2,7 @@
 
 방문자가 myungjinki의 웹 프로젝트를 한곳에서 찾아볼 수 있는 GitHub Pages 개인 사이트다. React와 TypeScript로 만들고 `gh-pages` 브랜치로 배포하며, 주소는 <https://myungjinki.github.io/>다.
 
-지금 상태는 [STATE.md](STATE.md), 할 일은 [TASKS.md](TASKS.md)에 있다.
+지금 상태는 [docs/state.md](docs/state.md)에 있다. 할 일은 이 저장소의 GitHub Issues에 있다.
 
 ## 시작하기
 
@@ -71,4 +71,3 @@ npm run build
 ## 문서
 
 - [작업 지침](AGENTS.md): 에이전트가 따르는 검증·커밋 규칙과 함정
-- [변경 기록](LANDED.md): 끝나거나 취소한 할 일
