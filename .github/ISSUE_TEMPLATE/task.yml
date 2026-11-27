@@ -31,7 +31,7 @@ body:
     id: kind
     attributes:
       label: 구분
-      description: "TASKS.md '일회성' 표의 구분 값(예: 문서, 스크립트)"
+      description: "할 일의 구분. `구분:<값>` 라벨이 된다(예: 문서, 스크립트)"
     validations:
       required: true
   - type: dropdown
